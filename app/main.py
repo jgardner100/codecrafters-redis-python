@@ -2,6 +2,70 @@ import socket
 import threading
 
 
+def parse_resp(data):
+    """
+    Parse RESP protocol data and return a list of strings.
+    Handles RESP Arrays.
+    """
+    data_str = data.decode('utf-8', errors='ignore')
+    lines = data_str.split('\r\n')
+    
+    result = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        if not line:
+            i += 1
+            continue
+        
+        if line.startswith('*'):
+            # Array
+            array_length = int(line[1:])
+            i += 1
+            for _ in range(array_length):
+                # Skip empty lines
+                while i < len(lines) and not lines[i]:
+                    i += 1
+                
+                if i < len(lines) and lines[i].startswith('$'):
+                    # Bulk string
+                    bulk_length = int(lines[i][1:])
+                    i += 1
+                    # Skip empty lines
+                    while i < len(lines) and not lines[i]:
+                        i += 1
+                    if i < len(lines):
+                        result.append(lines[i])
+                        i += 1
+                elif i < len(lines) and lines[i].startswith('+'):
+                    # Simple string
+                    result.append(lines[i][1:])
+                    i += 1
+        elif line.startswith('$'):
+            # Bulk string
+            bulk_length = int(line[1:])
+            i += 1
+            if i < len(lines):
+                result.append(lines[i])
+                i += 1
+        elif line.startswith('+'):
+            # Simple string
+            result.append(line[1:])
+            i += 1
+        else:
+            i += 1
+    
+    return result
+
+
+def encode_bulk_string(s):
+    """Encode a string as a RESP bulk string."""
+    s_bytes = s.encode('utf-8') if isinstance(s, str) else s
+    return f"${len(s_bytes)}\r\n{s_bytes.decode('utf-8')}\r\n".encode('utf-8')
+
+
 def handle_client(conn, addr):
     """Handle a single client connection."""
     print(f"Client connected: {addr}")
@@ -13,7 +77,28 @@ def handle_client(conn, addr):
             if not data:
                 break
             
-            conn.sendall(b"+PONG\r\n")
+            # Parse the RESP command
+            command_parts = parse_resp(data)
+            
+            if not command_parts:
+                continue
+            
+            # Get the command (case-insensitive)
+            command = command_parts[0].upper()
+            
+            if command == "PING":
+                conn.sendall(b"+PONG\r\n")
+            elif command == "ECHO":
+                if len(command_parts) > 1:
+                    # Send the argument as a bulk string
+                    response = encode_bulk_string(command_parts[1])
+                    conn.sendall(response)
+                else:
+                    # No argument provided
+                    conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+            else:
+                # Unknown command
+                conn.sendall(b"-ERR unknown command\r\n")
     
     print(f"Client disconnected: {addr}")
 
