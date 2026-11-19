@@ -2,6 +2,11 @@ import socket
 import threading
 
 
+# Global dictionary to store key-value pairs
+store = {}
+store_lock = threading.Lock()
+
+
 def parse_resp(data):
     """
     Parse RESP protocol data and return a list of strings.
@@ -66,6 +71,11 @@ def encode_bulk_string(s):
     return f"${len(s_bytes)}\r\n{s_bytes.decode('utf-8')}\r\n".encode('utf-8')
 
 
+def encode_null_bulk_string():
+    """Encode a null bulk string as per RESP protocol."""
+    return b"$-1\r\n"
+
+
 def handle_client(conn, addr):
     """Handle a single client connection."""
     print(f"Client connected: {addr}")
@@ -96,6 +106,32 @@ def handle_client(conn, addr):
                 else:
                     # No argument provided
                     conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+            elif command == "SET":
+                if len(command_parts) < 3:
+                    conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+                else:
+                    key = command_parts[1]
+                    value = command_parts[2]
+                    # Store the key-value pair with thread safety
+                    with store_lock:
+                        store[key] = value
+                    conn.sendall(b"+OK\r\n")
+            elif command == "GET":
+                if len(command_parts) < 2:
+                    conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
+                else:
+                    key = command_parts[1]
+                    # Retrieve the value with thread safety
+                    with store_lock:
+                        value = store.get(key)
+                    
+                    if value is None:
+                        # Key doesn't exist, return null bulk string
+                        conn.sendall(encode_null_bulk_string())
+                    else:
+                        # Return the value as a bulk string
+                        response = encode_bulk_string(value)
+                        conn.sendall(response)
             else:
                 # Unknown command
                 conn.sendall(b"-ERR unknown command\r\n")
