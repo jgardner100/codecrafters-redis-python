@@ -79,6 +79,11 @@ def encode_null_bulk_string():
     return b"$-1\r\n"
 
 
+def encode_integer(num):
+    """Encode an integer as a RESP integer."""
+    return f":{num}\r\n".encode('utf-8')
+
+
 def is_key_expired(key):
     """Check if a key has expired. Remove it if it has."""
     if key not in expiry_times:
@@ -196,6 +201,40 @@ def handle_client(conn, addr):
                         # Return the value as a bulk string
                         response = encode_bulk_string(value)
                         conn.sendall(response)
+            elif command == "RPUSH":
+                if len(command_parts) < 3:
+                    conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
+                else:
+                    key = command_parts[1]
+                    elements = command_parts[2:]
+                    
+                    with store_lock:
+                        # Check if key has expired
+                        if is_key_expired(key):
+                            # Key expired, treat as non-existent
+                            store[key] = []
+                        
+                        # If key doesn't exist, create a new list
+                        if key not in store:
+                            store[key] = []
+                        
+                        # Get the current value
+                        current_value = store[key]
+                        
+                        # Check if it's a list
+                        if isinstance(current_value, list):
+                            # Append elements to the list
+                            for element in elements:
+                                current_value.append(element)
+                            list_length = len(current_value)
+                        else:
+                            # Key exists but is not a list, error
+                            conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                            continue
+                    
+                    # Return the length of the list as an integer
+                    response = encode_integer(list_length)
+                    conn.sendall(response)
             else:
                 # Unknown command
                 conn.sendall(b"-ERR unknown command\r\n")
