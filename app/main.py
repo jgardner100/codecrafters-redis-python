@@ -1,9 +1,12 @@
 import socket
 import threading
+import time
 
 
 # Global dictionary to store key-value pairs
 store = {}
+# Dictionary to store expiry times (in absolute time)
+expiry_times = {}
 store_lock = threading.Lock()
 
 
@@ -76,6 +79,23 @@ def encode_null_bulk_string():
     return b"$-1\r\n"
 
 
+def is_key_expired(key):
+    """Check if a key has expired. Remove it if it has."""
+    if key not in expiry_times:
+        return False
+    
+    current_time = time.time() * 1000  # Convert to milliseconds
+    expiry_time = expiry_times[key]
+    
+    if current_time >= expiry_time:
+        # Key has expired, remove it
+        store.pop(key, None)
+        expiry_times.pop(key, None)
+        return True
+    
+    return False
+
+
 def handle_client(conn, addr):
     """Handle a single client connection."""
     print(f"Client connected: {addr}")
@@ -112,10 +132,50 @@ def handle_client(conn, addr):
                 else:
                     key = command_parts[1]
                     value = command_parts[2]
-                    # Store the key-value pair with thread safety
-                    with store_lock:
-                        store[key] = value
-                    conn.sendall(b"+OK\r\n")
+                    expiry_ms = None
+                    
+                    # Parse optional arguments
+                    i = 3
+                    while i < len(command_parts):
+                        option = command_parts[i].upper()
+                        if option == "EX":
+                            # Expiry in seconds
+                            if i + 1 < len(command_parts):
+                                try:
+                                    seconds = int(command_parts[i + 1])
+                                    expiry_ms = seconds * 1000
+                                    i += 2
+                                except ValueError:
+                                    conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                    break
+                            else:
+                                conn.sendall(b"-ERR syntax error\r\n")
+                                break
+                        elif option == "PX":
+                            # Expiry in milliseconds
+                            if i + 1 < len(command_parts):
+                                try:
+                                    expiry_ms = int(command_parts[i + 1])
+                                    i += 2
+                                except ValueError:
+                                    conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                    break
+                            else:
+                                conn.sendall(b"-ERR syntax error\r\n")
+                                break
+                        else:
+                            i += 1
+                    else:
+                        # Successfully parsed all options
+                        with store_lock:
+                            store[key] = value
+                            if expiry_ms is not None:
+                                # Calculate absolute expiry time in milliseconds
+                                expiry_times[key] = time.time() * 1000 + expiry_ms
+                            else:
+                                # No expiry, remove any existing expiry
+                                expiry_times.pop(key, None)
+                        conn.sendall(b"+OK\r\n")
             elif command == "GET":
                 if len(command_parts) < 2:
                     conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
@@ -123,7 +183,11 @@ def handle_client(conn, addr):
                     key = command_parts[1]
                     # Retrieve the value with thread safety
                     with store_lock:
-                        value = store.get(key)
+                        # Check if key has expired
+                        if is_key_expired(key):
+                            value = None
+                        else:
+                            value = store.get(key)
                     
                     if value is None:
                         # Key doesn't exist, return null bulk string
