@@ -266,6 +266,41 @@ def handle_client(conn, addr):
                     # Return the length of the list as an integer
                     response = encode_integer(list_length)
                     conn.sendall(response)
+            elif command == "LPUSH":
+                if len(command_parts) < 3:
+                    conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+                else:
+                    key = command_parts[1]
+                    elements = command_parts[2:]
+                    
+                    with store_lock:
+                        # Check if key has expired
+                        if is_key_expired(key):
+                            # Key expired, treat as non-existent
+                            store[key] = []
+                        
+                        # If key doesn't exist, create a new list
+                        if key not in store:
+                            store[key] = []
+                        
+                        # Get the current value
+                        current_value = store[key]
+                        
+                        # Check if it's a list
+                        if isinstance(current_value, list):
+                            # Prepend elements to the list
+                            # Each element is inserted at the front in order
+                            for element in elements:
+                                current_value.insert(0, element)
+                            list_length = len(current_value)
+                        else:
+                            # Key exists but is not a list, error
+                            conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                            continue
+                    
+                    # Return the length of the list as an integer
+                    response = encode_integer(list_length)
+                    conn.sendall(response)
             elif command == "LRANGE":
                 if len(command_parts) < 4:
                     conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
