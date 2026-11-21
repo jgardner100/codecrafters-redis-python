@@ -115,6 +115,23 @@ def is_key_expired(key):
     return False
 
 
+def normalize_index(index, list_length):
+    """
+    Convert an index (possibly negative) to a positive index.
+    Handles out-of-range negative indexes by treating them as 0.
+    """
+    if index < 0:
+        # Negative index: convert from end
+        positive_index = list_length + index
+        # If out of range, treat as 0
+        if positive_index < 0:
+            return 0
+        return positive_index
+    else:
+        # Positive index: return as-is
+        return index
+
+
 def handle_client(conn, addr):
     """Handle a single client connection."""
     print(f"Client connected: {addr}")
@@ -275,6 +292,10 @@ def handle_client(conn, addr):
                     else:
                         list_data = value
                         list_length = len(list_data)
+                        
+                        # Normalize negative indexes
+                        start = normalize_index(start, list_length)
+                        stop = normalize_index(stop, list_length)
                         
                         # Handle edge cases
                         if start >= list_length or start > stop:
