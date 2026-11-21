@@ -345,6 +345,28 @@ def handle_client(conn, addr):
                             result = list_data[start:stop + 1]
                             response = encode_array(result)
                             conn.sendall(response)
+            elif command == "LLEN":
+                if len(command_parts) < 2:
+                    conn.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
+                else:
+                    key = command_parts[1]
+                    
+                    with store_lock:
+                        # Check if key has expired
+                        if is_key_expired(key):
+                            value = None
+                        else:
+                            value = store.get(key)
+                    
+                    # If key doesn't exist or is not a list, return 0
+                    if value is None or not isinstance(value, list):
+                        response = encode_integer(0)
+                    else:
+                        # Return the length of the list as an integer
+                        list_length = len(value)
+                        response = encode_integer(list_length)
+                    
+                    conn.sendall(response)
             else:
                 # Unknown command
                 conn.sendall(b"-ERR unknown command\r\n")
@@ -353,14 +375,14 @@ def handle_client(conn, addr):
 
 
 def main():
-    print("Logs from your program will appear here!")
+    print("Logging starts here.")
 
     server_socket = socket.create_server(
-        ("localhost", 6379),
+        ("0.0.0.0", 6379),
         reuse_port=True
     )
 
-    print("Redis server listening on localhost:6379")
+    print("Redis server listening on 0.0.0.0:6379")
 
     while True:
         conn, addr = server_socket.accept()
