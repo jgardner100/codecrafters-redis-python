@@ -1,3 +1,5 @@
+#!/Users/johng/bin/python
+
 import socket
 import threading
 import time
@@ -82,6 +84,18 @@ def encode_null_bulk_string():
 def encode_integer(num):
     """Encode an integer as a RESP integer."""
     return f":{num}\r\n".encode('utf-8')
+
+
+def encode_array(elements):
+    """Encode a list of strings as a RESP array."""
+    if not elements:
+        return b"*0\r\n"
+    
+    response = f"*{len(elements)}\r\n".encode('utf-8')
+    for element in elements:
+        response += encode_bulk_string(element)
+    
+    return response
 
 
 def is_key_expired(key):
@@ -235,6 +249,46 @@ def handle_client(conn, addr):
                     # Return the length of the list as an integer
                     response = encode_integer(list_length)
                     conn.sendall(response)
+            elif command == "LRANGE":
+                if len(command_parts) < 4:
+                    conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+                else:
+                    key = command_parts[1]
+                    
+                    try:
+                        start = int(command_parts[2])
+                        stop = int(command_parts[3])
+                    except ValueError:
+                        conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                        continue
+                    
+                    with store_lock:
+                        # Check if key has expired
+                        if is_key_expired(key):
+                            value = None
+                        else:
+                            value = store.get(key)
+                    
+                    # If key doesn't exist or is not a list, return empty array
+                    if value is None or not isinstance(value, list):
+                        conn.sendall(encode_array([]))
+                    else:
+                        list_data = value
+                        list_length = len(list_data)
+                        
+                        # Handle edge cases
+                        if start >= list_length or start > stop:
+                            # Return empty array
+                            conn.sendall(encode_array([]))
+                        else:
+                            # Clamp stop index to list length
+                            if stop >= list_length:
+                                stop = list_length - 1
+                            
+                            # Extract the range
+                            result = list_data[start:stop + 1]
+                            response = encode_array(result)
+                            conn.sendall(response)
             else:
                 # Unknown command
                 conn.sendall(b"-ERR unknown command\r\n")
