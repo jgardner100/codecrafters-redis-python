@@ -160,7 +160,10 @@ def get_key_type(key):
         elif isinstance(value, set):
             return "set"
         elif isinstance(value, dict):
-            # Could be a hash or zset, for now treat as hash
+            # Check if it's a stream (has a special marker)
+            if "_stream_entries" in value:
+                return "stream"
+            # Otherwise treat as hash
             return "hash"
         else:
             # Default to string for unknown types
@@ -200,6 +203,14 @@ def notify_blocked_clients(key, element):
             event.set()
             return True
     return False
+
+
+def generate_stream_id(current_timestamp_ms, entry_count_at_ms):
+    """
+    Generate a stream ID in the format: timestamp-sequence
+    where timestamp is in milliseconds and sequence is the entry count at that timestamp.
+    """
+    return f"{current_timestamp_ms}-{entry_count_at_ms}"
 
 
 def handle_client(conn, addr):
@@ -597,6 +608,62 @@ def handle_client(conn, addr):
                                     blocked_clients[key] = [(c, e) for c, e in blocked_clients[key] if e is not event]
                                     if len(blocked_clients[key]) == 0:
                                         del blocked_clients[key]
+                elif command == "XADD":
+                    if len(command_parts) < 4:
+                        conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        entry_id = command_parts[2]
+                        
+                        # Extract key-value pairs
+                        kv_pairs = command_parts[3:]
+                        
+                        # Validate that we have an even number of arguments for key-value pairs
+                        if len(kv_pairs) % 2 != 0:
+                            conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                            continue
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                # Key expired, treat as non-existent
+                                stream_data = {
+                                    "_stream_entries": []
+                                }
+                                store[key] = stream_data
+                            
+                            # If key doesn't exist, create a new stream
+                            if key not in store:
+                                stream_data = {
+                                    "_stream_entries": []
+                                }
+                                store[key] = stream_data
+                            
+                            # Get the current value
+                            current_value = store[key]
+                            
+                            # Check if it's a stream
+                            if isinstance(current_value, dict) and "_stream_entries" in current_value:
+                                # Create entry object with ID and key-value pairs
+                                entry = {"id": entry_id}
+                                
+                                # Add key-value pairs to entry
+                                for i in range(0, len(kv_pairs), 2):
+                                    entry_key = kv_pairs[i]
+                                    entry_value = kv_pairs[i + 1]
+                                    entry[entry_key] = entry_value
+                                
+                                # Add entry to stream
+                                current_value["_stream_entries"].append(entry)
+                                
+                                # Return the entry ID
+                                response = encode_bulk_string(entry_id)
+                            else:
+                                # Key exists but is not a stream, error
+                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                continue
+                        
+                        conn.sendall(response)
                 else:
                     # Unknown command
                     conn.sendall(b"-ERR unknown command\r\n")
