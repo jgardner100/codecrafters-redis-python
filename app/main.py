@@ -84,7 +84,14 @@ def parse_resp(data):
 
 def encode_bulk_string(s):
     """Encode a string as a RESP bulk string."""
-    s_bytes = s.encode('utf-8') if isinstance(s, str) else s
+    if isinstance(s, str):
+        s_bytes = s.encode('utf-8')
+    elif isinstance(s, bytes):
+        s_bytes = s
+    else:
+        # Convert to string first
+        s_bytes = str(s).encode('utf-8')
+    
     return f"${len(s_bytes)}\r\n{s_bytes.decode('utf-8')}\r\n".encode('utf-8')
 
 
@@ -116,6 +123,42 @@ def encode_array(elements):
     response = f"*{len(elements)}\r\n".encode('utf-8')
     for element in elements:
         response += encode_bulk_string(element)
+    
+    return response
+
+
+def encode_nested_array(nested_elements):
+    """
+    Encode a nested array (array of arrays) as a RESP array.
+    Each element in nested_elements should be a list.
+    
+    For XRANGE response, each element should be [entry_id, [k1, v1, k2, v2, ...]].
+    The inner array should be properly encoded as an array, not a string.
+    """
+    if not nested_elements:
+        return b"*0\r\n"
+    
+    response = b""
+    response += f"*{len(nested_elements)}\r\n".encode('utf-8')
+    
+    for element_list in nested_elements:
+        if isinstance(element_list, list):
+            # Encode the inner array with 2 elements: [id, [kv_pairs]]
+            # element_list[0] is the entry_id (string)
+            # element_list[1] is the kv_list (list of strings)
+            response += b"*2\r\n"  # Array with 2 elements
+            
+            # First element: entry_id (bulk string)
+            response += encode_bulk_string(element_list[0])
+            
+            # Second element: kv_list (array of bulk strings)
+            kv_array = element_list[1]
+            response += f"*{len(kv_array)}\r\n".encode('utf-8')
+            for kv_item in kv_array:
+                response += encode_bulk_string(kv_item)
+        else:
+            # Fallback for non-list elements
+            response += encode_bulk_string(str(element_list))
     
     return response
 
@@ -250,6 +293,67 @@ def parse_stream_id(stream_id_str):
             return milliseconds_time, sequence_number
     except (ValueError, AttributeError):
         return None, None
+
+
+def parse_range_id(range_id_str):
+    """
+    Parse a range ID for XRANGE queries.
+    
+    Handles:
+    - Explicit format: "1526919030473-0" (both parts are numbers)
+    - Partial format: "1526919030473" (only time part, sequence defaults)
+    - Special "-" (use minimum/maximum)
+    
+    Returns (milliseconds_time, sequence_number) or raises ValueError if invalid.
+    
+    For start ID: defaults sequence to 0 if omitted.
+    For end ID: defaults sequence to maximum (a very large number).
+    
+    This function assumes 'is_start' parameter will be passed elsewhere.
+    For now, we'll handle it in the caller context.
+    """
+    if range_id_str == "-":
+        # Minimum ID indicator (for start of range)
+        return 0, 0
+    elif range_id_str == "+":
+        # Maximum ID indicator (for end of range)
+        return 2**63 - 1, 2**63 - 1  # Use very large numbers
+    
+    try:
+        if "-" in range_id_str:
+            parts = range_id_str.split("-", 1)
+            milliseconds_time = int(parts[0])
+            sequence_number = int(parts[1])
+            return milliseconds_time, sequence_number
+        else:
+            # Only time part provided
+            milliseconds_time = int(range_id_str)
+            # Sequence will be set by caller based on context (start vs end)
+            return milliseconds_time, None
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid range ID: {range_id_str}")
+
+
+def compare_stream_ids(id1_ms, id1_seq, id2_ms, id2_seq):
+    """
+    Compare two stream IDs.
+    Returns:
+    -1 if id1 < id2
+     0 if id1 == id2
+     1 if id1 > id2
+    """
+    if id1_ms < id2_ms:
+        return -1
+    elif id1_ms > id2_ms:
+        return 1
+    else:
+        # milliseconds_time is equal, compare sequence
+        if id1_seq < id2_seq:
+            return -1
+        elif id1_seq > id2_seq:
+            return 1
+        else:
+            return 0
 
 
 def is_stream_id_valid(new_id_str, last_id_str=None):
@@ -839,6 +943,71 @@ def handle_client(conn, addr):
                                 continue
                         
                         conn.sendall(response)
+                elif command == "XRANGE":
+                    if len(command_parts) < 4:
+                        conn.sendall(b"-ERR wrong number of arguments for 'xrange' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        start_id_str = command_parts[2]
+                        end_id_str = command_parts[3]
+                        
+                        try:
+                            # Parse start ID (default sequence to 0 if omitted)
+                            start_ms, start_seq = parse_range_id(start_id_str)
+                            if start_seq is None:
+                                start_seq = 0
+                            
+                            # Parse end ID (default sequence to max if omitted)
+                            end_ms, end_seq = parse_range_id(end_id_str)
+                            if end_seq is None:
+                                end_seq = 2**63 - 1  # Maximum possible sequence number
+                        except ValueError as e:
+                            conn.sendall(encode_error(f"ERR {str(e)}"))
+                            continue
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                stream_value = None
+                            else:
+                                stream_value = store.get(key)
+                            
+                            # If key doesn't exist or is not a stream, return empty array
+                            if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                conn.sendall(encode_array([]))
+                            else:
+                                # Get all entries
+                                entries = stream_value["_stream_entries"]
+                                
+                                # Filter entries within the range
+                                range_entries = []
+                                for entry in entries:
+                                    entry_id = entry["id"]
+                                    entry_ms, entry_seq = parse_stream_id(entry_id)
+                                    
+                                    # Check if entry ID is within range [start, end]
+                                    if compare_stream_ids(entry_ms, entry_seq, start_ms, start_seq) >= 0 and \
+                                       compare_stream_ids(entry_ms, entry_seq, end_ms, end_seq) <= 0:
+                                        # Entry is within range, include it
+                                        range_entries.append(entry)
+                                
+                                # Format response as nested array
+                                response_data = []
+                                for entry in range_entries:
+                                    entry_id = entry["id"]
+                                    # Build key-value pairs list (excluding the "id" key)
+                                    kv_list = []
+                                    for key_name in sorted(entry.keys()):
+                                        if key_name != "id":
+                                            kv_list.append(key_name)
+                                            kv_list.append(entry[key_name])
+                                    
+                                    # Each entry is [id, [k1, v1, k2, v2, ...]]
+                                    response_data.append([entry_id, kv_list])
+                                
+                                # Encode as nested array
+                                response = encode_nested_array(response_data)
+                                conn.sendall(response)
                 else:
                     # Unknown command
                     conn.sendall(b"-ERR unknown command\r\n")
