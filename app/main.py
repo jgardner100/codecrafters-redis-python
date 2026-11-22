@@ -13,6 +13,11 @@ store = {}
 expiry_times = {}
 store_lock = threading.Lock()
 
+# Dictionary to track blocked clients waiting for lists
+# Format: {key: [(connection, event), ...]}
+blocked_clients = {}
+blocked_clients_lock = threading.Lock()
+
 # Metrics tracking
 start_time = time.time()
 active_connections = 0
@@ -88,6 +93,11 @@ def encode_null_bulk_string():
     return b"$-1\r\n"
 
 
+def encode_null_array():
+    """Encode a null array as per RESP protocol."""
+    return b"*-1\r\n"
+
+
 def encode_integer(num):
     """Encode an integer as a RESP integer."""
     return f":{num}\r\n".encode('utf-8')
@@ -137,6 +147,24 @@ def normalize_index(index, list_length):
     else:
         # Positive index: return as-is
         return index
+
+
+def notify_blocked_clients(key, element):
+    """
+    Notify the first blocked client waiting for a key that an element is available.
+    Returns True if a client was notified, False otherwise.
+    """
+    with blocked_clients_lock:
+        if key in blocked_clients and len(blocked_clients[key]) > 0:
+            # Get the first (oldest) blocked client
+            conn, event = blocked_clients[key].pop(0)
+            # Clean up empty lists
+            if len(blocked_clients[key]) == 0:
+                del blocked_clients[key]
+            # Signal the event to wake up the blocked client
+            event.set()
+            return True
+    return False
 
 
 def handle_client(conn, addr):
@@ -279,6 +307,9 @@ def handle_client(conn, addr):
                         # Return the length of the list as an integer
                         response = encode_integer(list_length)
                         conn.sendall(response)
+                        
+                        # Notify blocked clients waiting for this key
+                        notify_blocked_clients(key, elements[0])
                 elif command == "LPUSH":
                     if len(command_parts) < 3:
                         conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
@@ -314,6 +345,9 @@ def handle_client(conn, addr):
                         # Return the length of the list as an integer
                         response = encode_integer(list_length)
                         conn.sendall(response)
+                        
+                        # Notify blocked clients waiting for this key
+                        notify_blocked_clients(key, elements[0])
                 elif command == "LRANGE":
                     if len(command_parts) < 4:
                         conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
@@ -437,6 +471,87 @@ def handle_client(conn, addr):
                                         response = encode_array(removed_elements)
                         
                         conn.sendall(response)
+                elif command == "BLPOP":
+                    if len(command_parts) < 3:
+                        conn.sendall(b"-ERR wrong number of arguments for 'blpop' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        
+                        try:
+                            timeout = int(command_parts[2])
+                        except ValueError:
+                            conn.sendall(b"-ERR timeout is not an integer or out of range\r\n")
+                            continue
+                        
+                        # Try to pop an element immediately
+                        element = None
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
+                            
+                            # If key exists and is a non-empty list
+                            if value is not None and isinstance(value, list) and len(value) > 0:
+                                element = value.pop(0)
+                        
+                        if element is not None:
+                            # Element was available, return it immediately
+                            response = encode_array([key, element])
+                            conn.sendall(response)
+                        else:
+                            # No element available, block the client
+                            event = threading.Event()
+                            
+                            # Register this client as blocked for this key
+                            with blocked_clients_lock:
+                                if key not in blocked_clients:
+                                    blocked_clients[key] = []
+                                blocked_clients[key].append((conn, event))
+                            
+                            # Wait for the event to be signaled (with timeout if specified)
+                            # timeout 0 means wait indefinitely
+                            if timeout == 0:
+                                event.wait()
+                            else:
+                                event.wait(timeout=timeout)
+                            
+                            # Check if we were signaled or timed out
+                            if event.is_set():
+                                # We were signaled, an element is available
+                                with store_lock:
+                                    # Check if key has expired
+                                    if is_key_expired(key):
+                                        value = None
+                                    else:
+                                        value = store.get(key)
+                                    
+                                    # Pop the element
+                                    if value is not None and isinstance(value, list) and len(value) > 0:
+                                        element = value.pop(0)
+                                    else:
+                                        element = None
+                                
+                                if element is not None:
+                                    response = encode_array([key, element])
+                                    conn.sendall(response)
+                                else:
+                                    # This shouldn't happen, but handle it gracefully
+                                    response = encode_null_array()
+                                    conn.sendall(response)
+                            else:
+                                # Timeout reached, return null array
+                                response = encode_null_array()
+                                conn.sendall(response)
+                            
+                            # Clean up the blocked client registration
+                            with blocked_clients_lock:
+                                if key in blocked_clients:
+                                    # Remove this client from the blocked list if it's still there
+                                    blocked_clients[key] = [(c, e) for c, e in blocked_clients[key] if e is not event]
+                                    if len(blocked_clients[key]) == 0:
+                                        del blocked_clients[key]
                 else:
                     # Unknown command
                     conn.sendall(b"-ERR unknown command\r\n")
