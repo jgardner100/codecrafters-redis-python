@@ -477,10 +477,11 @@ def handle_client(conn, addr):
                     else:
                         key = command_parts[1]
                         
+                        # Parse timeout as a float to support decimal values like 0.5, 0.1
                         try:
-                            timeout = int(command_parts[2])
+                            timeout = float(command_parts[2])
                         except ValueError:
-                            conn.sendall(b"-ERR timeout is not an integer or out of range\r\n")
+                            conn.sendall(b"-ERR timeout is not a float or out of range\r\n")
                             continue
                         
                         # Try to pop an element immediately
