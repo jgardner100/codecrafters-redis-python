@@ -3,6 +3,7 @@
 import socket
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 # Global dictionary to store key-value pairs
@@ -10,6 +11,11 @@ store = {}
 # Dictionary to store expiry times (in absolute time)
 expiry_times = {}
 store_lock = threading.Lock()
+
+# Metrics tracking
+start_time = time.time()
+active_connections = 0
+connections_lock = threading.Lock()
 
 
 def parse_resp(data):
@@ -134,248 +140,336 @@ def normalize_index(index, list_length):
 
 def handle_client(conn, addr):
     """Handle a single client connection."""
+    global active_connections
+    
     print(f"Client connected: {addr}")
     
-    with conn:
-        while True:
-            data = conn.recv(1024)
-            
-            if not data:
-                break
-            
-            # Parse the RESP command
-            command_parts = parse_resp(data)
-            
-            if not command_parts:
-                continue
-            
-            # Get the command (case-insensitive)
-            command = command_parts[0].upper()
-            
-            if command == "PING":
-                conn.sendall(b"+PONG\r\n")
-            elif command == "ECHO":
-                if len(command_parts) > 1:
-                    # Send the argument as a bulk string
-                    response = encode_bulk_string(command_parts[1])
-                    conn.sendall(response)
-                else:
-                    # No argument provided
-                    conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
-            elif command == "SET":
-                if len(command_parts) < 3:
-                    conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
-                else:
-                    key = command_parts[1]
-                    value = command_parts[2]
-                    expiry_ms = None
-                    
-                    # Parse optional arguments
-                    i = 3
-                    while i < len(command_parts):
-                        option = command_parts[i].upper()
-                        if option == "EX":
-                            # Expiry in seconds
-                            if i + 1 < len(command_parts):
-                                try:
-                                    seconds = int(command_parts[i + 1])
-                                    expiry_ms = seconds * 1000
-                                    i += 2
-                                except ValueError:
-                                    conn.sendall(b"-ERR invalid expire time in set\r\n")
-                                    break
-                            else:
-                                conn.sendall(b"-ERR syntax error\r\n")
-                                break
-                        elif option == "PX":
-                            # Expiry in milliseconds
-                            if i + 1 < len(command_parts):
-                                try:
-                                    expiry_ms = int(command_parts[i + 1])
-                                    i += 2
-                                except ValueError:
-                                    conn.sendall(b"-ERR invalid expire time in set\r\n")
-                                    break
-                            else:
-                                conn.sendall(b"-ERR syntax error\r\n")
-                                break
-                        else:
-                            i += 1
-                    else:
-                        # Successfully parsed all options
-                        with store_lock:
-                            store[key] = value
-                            if expiry_ms is not None:
-                                # Calculate absolute expiry time in milliseconds
-                                expiry_times[key] = time.time() * 1000 + expiry_ms
-                            else:
-                                # No expiry, remove any existing expiry
-                                expiry_times.pop(key, None)
-                        conn.sendall(b"+OK\r\n")
-            elif command == "GET":
-                if len(command_parts) < 2:
-                    conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
-                else:
-                    key = command_parts[1]
-                    # Retrieve the value with thread safety
-                    with store_lock:
-                        # Check if key has expired
-                        if is_key_expired(key):
-                            value = None
-                        else:
-                            value = store.get(key)
-                    
-                    if value is None:
-                        # Key doesn't exist, return null bulk string
-                        conn.sendall(encode_null_bulk_string())
-                    else:
-                        # Return the value as a bulk string
-                        response = encode_bulk_string(value)
+    with connections_lock:
+        active_connections += 1
+    
+    try:
+        with conn:
+            while True:
+                data = conn.recv(1024)
+                
+                if not data:
+                    break
+                
+                # Parse the RESP command
+                command_parts = parse_resp(data)
+                
+                if not command_parts:
+                    continue
+                
+                # Get the command (case-insensitive)
+                command = command_parts[0].upper()
+                
+                if command == "PING":
+                    conn.sendall(b"+PONG\r\n")
+                elif command == "ECHO":
+                    if len(command_parts) > 1:
+                        # Send the argument as a bulk string
+                        response = encode_bulk_string(command_parts[1])
                         conn.sendall(response)
-            elif command == "RPUSH":
-                if len(command_parts) < 3:
-                    conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
-                else:
-                    key = command_parts[1]
-                    elements = command_parts[2:]
-                    
-                    with store_lock:
-                        # Check if key has expired
-                        if is_key_expired(key):
-                            # Key expired, treat as non-existent
-                            store[key] = []
-                        
-                        # If key doesn't exist, create a new list
-                        if key not in store:
-                            store[key] = []
-                        
-                        # Get the current value
-                        current_value = store[key]
-                        
-                        # Check if it's a list
-                        if isinstance(current_value, list):
-                            # Append elements to the list
-                            for element in elements:
-                                current_value.append(element)
-                            list_length = len(current_value)
-                        else:
-                            # Key exists but is not a list, error
-                            conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
-                            continue
-                    
-                    # Return the length of the list as an integer
-                    response = encode_integer(list_length)
-                    conn.sendall(response)
-            elif command == "LPUSH":
-                if len(command_parts) < 3:
-                    conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
-                else:
-                    key = command_parts[1]
-                    elements = command_parts[2:]
-                    
-                    with store_lock:
-                        # Check if key has expired
-                        if is_key_expired(key):
-                            # Key expired, treat as non-existent
-                            store[key] = []
-                        
-                        # If key doesn't exist, create a new list
-                        if key not in store:
-                            store[key] = []
-                        
-                        # Get the current value
-                        current_value = store[key]
-                        
-                        # Check if it's a list
-                        if isinstance(current_value, list):
-                            # Prepend elements to the list
-                            # Each element is inserted at the front in order
-                            for element in elements:
-                                current_value.insert(0, element)
-                            list_length = len(current_value)
-                        else:
-                            # Key exists but is not a list, error
-                            conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
-                            continue
-                    
-                    # Return the length of the list as an integer
-                    response = encode_integer(list_length)
-                    conn.sendall(response)
-            elif command == "LRANGE":
-                if len(command_parts) < 4:
-                    conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
-                else:
-                    key = command_parts[1]
-                    
-                    try:
-                        start = int(command_parts[2])
-                        stop = int(command_parts[3])
-                    except ValueError:
-                        conn.sendall(b"-ERR value is not an integer or out of range\r\n")
-                        continue
-                    
-                    with store_lock:
-                        # Check if key has expired
-                        if is_key_expired(key):
-                            value = None
-                        else:
-                            value = store.get(key)
-                    
-                    # If key doesn't exist or is not a list, return empty array
-                    if value is None or not isinstance(value, list):
-                        conn.sendall(encode_array([]))
                     else:
-                        list_data = value
-                        list_length = len(list_data)
+                        # No argument provided
+                        conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+                elif command == "SET":
+                    if len(command_parts) < 3:
+                        conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        value = command_parts[2]
+                        expiry_ms = None
                         
-                        # Normalize negative indexes
-                        start = normalize_index(start, list_length)
-                        stop = normalize_index(stop, list_length)
+                        # Parse optional arguments
+                        i = 3
+                        while i < len(command_parts):
+                            option = command_parts[i].upper()
+                            if option == "EX":
+                                # Expiry in seconds
+                                if i + 1 < len(command_parts):
+                                    try:
+                                        seconds = int(command_parts[i + 1])
+                                        expiry_ms = seconds * 1000
+                                        i += 2
+                                    except ValueError:
+                                        conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                        break
+                                else:
+                                    conn.sendall(b"-ERR syntax error\r\n")
+                                    break
+                            elif option == "PX":
+                                # Expiry in milliseconds
+                                if i + 1 < len(command_parts):
+                                    try:
+                                        expiry_ms = int(command_parts[i + 1])
+                                        i += 2
+                                    except ValueError:
+                                        conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                        break
+                                else:
+                                    conn.sendall(b"-ERR syntax error\r\n")
+                                    break
+                            else:
+                                i += 1
+                        else:
+                            # Successfully parsed all options
+                            with store_lock:
+                                store[key] = value
+                                if expiry_ms is not None:
+                                    # Calculate absolute expiry time in milliseconds
+                                    expiry_times[key] = time.time() * 1000 + expiry_ms
+                                else:
+                                    # No expiry, remove any existing expiry
+                                    expiry_times.pop(key, None)
+                            conn.sendall(b"+OK\r\n")
+                elif command == "GET":
+                    if len(command_parts) < 2:
+                        conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        # Retrieve the value with thread safety
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
                         
-                        # Handle edge cases
-                        if start >= list_length or start > stop:
-                            # Return empty array
+                        if value is None:
+                            # Key doesn't exist, return null bulk string
+                            conn.sendall(encode_null_bulk_string())
+                        else:
+                            # Return the value as a bulk string
+                            response = encode_bulk_string(value)
+                            conn.sendall(response)
+                elif command == "RPUSH":
+                    if len(command_parts) < 3:
+                        conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        elements = command_parts[2:]
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                # Key expired, treat as non-existent
+                                store[key] = []
+                            
+                            # If key doesn't exist, create a new list
+                            if key not in store:
+                                store[key] = []
+                            
+                            # Get the current value
+                            current_value = store[key]
+                            
+                            # Check if it's a list
+                            if isinstance(current_value, list):
+                                # Append elements to the list
+                                for element in elements:
+                                    current_value.append(element)
+                                list_length = len(current_value)
+                            else:
+                                # Key exists but is not a list, error
+                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                continue
+                        
+                        # Return the length of the list as an integer
+                        response = encode_integer(list_length)
+                        conn.sendall(response)
+                elif command == "LPUSH":
+                    if len(command_parts) < 3:
+                        conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        elements = command_parts[2:]
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                # Key expired, treat as non-existent
+                                store[key] = []
+                            
+                            # If key doesn't exist, create a new list
+                            if key not in store:
+                                store[key] = []
+                            
+                            # Get the current value
+                            current_value = store[key]
+                            
+                            # Check if it's a list
+                            if isinstance(current_value, list):
+                                # Prepend elements to the list
+                                # Each element is inserted at the front in order
+                                for element in elements:
+                                    current_value.insert(0, element)
+                                list_length = len(current_value)
+                            else:
+                                # Key exists but is not a list, error
+                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                continue
+                        
+                        # Return the length of the list as an integer
+                        response = encode_integer(list_length)
+                        conn.sendall(response)
+                elif command == "LRANGE":
+                    if len(command_parts) < 4:
+                        conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        
+                        try:
+                            start = int(command_parts[2])
+                            stop = int(command_parts[3])
+                        except ValueError:
+                            conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                            continue
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
+                        
+                        # If key doesn't exist or is not a list, return empty array
+                        if value is None or not isinstance(value, list):
                             conn.sendall(encode_array([]))
                         else:
-                            # Clamp stop index to list length
-                            if stop >= list_length:
-                                stop = list_length - 1
+                            list_data = value
+                            list_length = len(list_data)
                             
-                            # Extract the range
-                            result = list_data[start:stop + 1]
-                            response = encode_array(result)
-                            conn.sendall(response)
-            elif command == "LLEN":
-                if len(command_parts) < 2:
-                    conn.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
-                else:
-                    key = command_parts[1]
-                    
-                    with store_lock:
-                        # Check if key has expired
-                        if is_key_expired(key):
-                            value = None
-                        else:
-                            value = store.get(key)
-                    
-                    # If key doesn't exist or is not a list, return 0
-                    if value is None or not isinstance(value, list):
-                        response = encode_integer(0)
+                            # Normalize negative indexes
+                            start = normalize_index(start, list_length)
+                            stop = normalize_index(stop, list_length)
+                            
+                            # Handle edge cases
+                            if start >= list_length or start > stop:
+                                # Return empty array
+                                conn.sendall(encode_array([]))
+                            else:
+                                # Clamp stop index to list length
+                                if stop >= list_length:
+                                    stop = list_length - 1
+                                
+                                # Extract the range
+                                result = list_data[start:stop + 1]
+                                response = encode_array(result)
+                                conn.sendall(response)
+                elif command == "LLEN":
+                    if len(command_parts) < 2:
+                        conn.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
                     else:
-                        # Return the length of the list as an integer
-                        list_length = len(value)
-                        response = encode_integer(list_length)
-                    
-                    conn.sendall(response)
-            else:
-                # Unknown command
-                conn.sendall(b"-ERR unknown command\r\n")
+                        key = command_parts[1]
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
+                        
+                        # If key doesn't exist or is not a list, return 0
+                        if value is None or not isinstance(value, list):
+                            response = encode_integer(0)
+                        else:
+                            # Return the length of the list as an integer
+                            list_length = len(value)
+                            response = encode_integer(list_length)
+                        
+                        conn.sendall(response)
+                elif command == "LPOP":
+                    if len(command_parts) < 2:
+                        conn.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
+                            
+                            # If key doesn't exist or is not a list, return null bulk string
+                            if value is None or not isinstance(value, list):
+                                element = None
+                            else:
+                                # If list is empty, return null bulk string
+                                if len(value) == 0:
+                                    element = None
+                                else:
+                                    # Remove and return the first element
+                                    element = value.pop(0)
+                        
+                        if element is None:
+                            # Return null bulk string
+                            conn.sendall(encode_null_bulk_string())
+                        else:
+                            # Return the element as a bulk string
+                            response = encode_bulk_string(element)
+                            conn.sendall(response)
+                else:
+                    # Unknown command
+                    conn.sendall(b"-ERR unknown command\r\n")
+    finally:
+        with connections_lock:
+            active_connections -= 1
+        print(f"Client disconnected: {addr}")
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for Prometheus metrics."""
     
-    print(f"Client disconnected: {addr}")
+    def do_GET(self):
+        """Handle GET requests."""
+        if self.path == '/metrics':
+            uptime_seconds = time.time() - start_time
+            
+            with connections_lock:
+                current_connections = active_connections
+            
+            metrics_output = f"""# HELP redis_uptime_seconds Redis server uptime in seconds
+# TYPE redis_uptime_seconds gauge
+redis_uptime_seconds {uptime_seconds}
+
+# HELP redis_connections_active Number of currently active client connections
+# TYPE redis_connections_active gauge
+redis_connections_active {current_connections}
+"""
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; version=0.0.4')
+            self.end_headers()
+            self.wfile.write(metrics_output.encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
+
+
+def run_metrics_server():
+    """Run the Prometheus metrics HTTP server."""
+    metrics_server = HTTPServer(('0.0.0.0', 8100), MetricsHandler)
+    print("Prometheus metrics server listening on 0.0.0.0:8100")
+    metrics_server.serve_forever()
 
 
 def main():
     print("Logging starts here.")
+
+    # Start metrics server in a separate daemon thread
+    metrics_thread = threading.Thread(
+        target=run_metrics_server,
+        daemon=True
+    )
+    metrics_thread.start()
 
     server_socket = socket.create_server(
         ("0.0.0.0", 6379),
