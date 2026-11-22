@@ -120,6 +120,11 @@ def encode_array(elements):
     return response
 
 
+def encode_error(error_message):
+    """Encode an error message as a RESP simple error."""
+    return f"-{error_message}\r\n".encode('utf-8')
+
+
 def is_key_expired(key):
     """Check if a key has expired. Remove it if it has."""
     if key not in expiry_times:
@@ -211,6 +216,70 @@ def generate_stream_id(current_timestamp_ms, entry_count_at_ms):
     where timestamp is in milliseconds and sequence is the entry count at that timestamp.
     """
     return f"{current_timestamp_ms}-{entry_count_at_ms}"
+
+
+def parse_stream_id(stream_id_str):
+    """
+    Parse a stream ID string into (milliseconds_time, sequence_number).
+    Returns (milliseconds_time, sequence_number) or (None, None) if invalid format.
+    """
+    try:
+        parts = stream_id_str.split('-')
+        if len(parts) != 2:
+            return None, None
+        
+        milliseconds_time = int(parts[0])
+        sequence_number = int(parts[1])
+        
+        return milliseconds_time, sequence_number
+    except (ValueError, AttributeError):
+        return None, None
+
+
+def is_stream_id_valid(new_id_str, last_id_str=None):
+    """
+    Validate a stream ID.
+    
+    Rules:
+    1. The ID must be strictly greater than 0-0 (minimum valid ID is 0-1).
+    2. If there's a last ID, the new ID must be strictly greater than it.
+    
+    Returns:
+    - (True, None) if valid
+    - (False, error_message) if invalid
+    """
+    # Parse the new ID
+    new_ms, new_seq = parse_stream_id(new_id_str)
+    
+    if new_ms is None or new_seq is None:
+        return False, "ERR invalid stream ID"
+    
+    # Check if ID is greater than 0-0
+    if new_ms == 0 and new_seq == 0:
+        return False, "ERR The ID specified in XADD must be greater than 0-0"
+    
+    # If there's a last ID, check that new ID is strictly greater
+    if last_id_str is not None:
+        last_ms, last_seq = parse_stream_id(last_id_str)
+        
+        if last_ms is None or last_seq is None:
+            return False, "ERR invalid last stream ID"
+        
+        # New ID must be strictly greater than last ID
+        if new_ms > last_ms:
+            # milliseconds_time is greater, so this is valid
+            return True, None
+        elif new_ms == last_ms:
+            # milliseconds_time is equal, check sequence number
+            if new_seq > last_seq:
+                return True, None
+            else:
+                return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+        else:
+            # milliseconds_time is smaller, invalid
+            return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+    
+    return True, None
 
 
 def handle_client(conn, addr):
@@ -644,6 +713,23 @@ def handle_client(conn, addr):
                             
                             # Check if it's a stream
                             if isinstance(current_value, dict) and "_stream_entries" in current_value:
+                                # Validate the entry ID
+                                entries = current_value["_stream_entries"]
+                                last_id = None
+                                
+                                if len(entries) > 0:
+                                    # Get the ID of the last entry
+                                    last_id = entries[-1]["id"]
+                                
+                                # Validate the new ID
+                                is_valid, error_msg = is_stream_id_valid(entry_id, last_id)
+                                
+                                if not is_valid:
+                                    # ID is invalid, send error
+                                    error_response = encode_error(error_msg)
+                                    conn.sendall(error_response)
+                                    continue
+                                
                                 # Create entry object with ID and key-value pairs
                                 entry = {"id": entry_id}
                                 
