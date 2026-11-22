@@ -1,4 +1,5 @@
 #!/Users/johng/bin/python
+#!/usr/bin/python
 
 import socket
 import threading
@@ -384,6 +385,18 @@ def handle_client(conn, addr):
                         conn.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
                     else:
                         key = command_parts[1]
+                        count = None
+                        
+                        # Parse optional count argument
+                        if len(command_parts) >= 3:
+                            try:
+                                count = int(command_parts[2])
+                                if count < 0:
+                                    conn.sendall(b"-ERR count should be a positive integer\r\n")
+                                    continue
+                            except ValueError:
+                                conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                                continue
                         
                         with store_lock:
                             # Check if key has expired
@@ -392,24 +405,38 @@ def handle_client(conn, addr):
                             else:
                                 value = store.get(key)
                             
-                            # If key doesn't exist or is not a list, return null bulk string
+                            # If key doesn't exist or is not a list
                             if value is None or not isinstance(value, list):
-                                element = None
-                            else:
-                                # If list is empty, return null bulk string
-                                if len(value) == 0:
-                                    element = None
+                                if count is None:
+                                    # No count specified: return null bulk string
+                                    response = encode_null_bulk_string()
                                 else:
-                                    # Remove and return the first element
-                                    element = value.pop(0)
+                                    # Count specified: return empty array
+                                    response = encode_array([])
+                            else:
+                                # List exists
+                                if len(value) == 0:
+                                    if count is None:
+                                        # No count specified: return null bulk string
+                                        response = encode_null_bulk_string()
+                                    else:
+                                        # Count specified: return empty array
+                                        response = encode_array([])
+                                else:
+                                    if count is None:
+                                        # No count specified: remove and return single element
+                                        element = value.pop(0)
+                                        response = encode_bulk_string(element)
+                                    else:
+                                        # Count specified: remove and return multiple elements
+                                        # Remove up to count elements from the front
+                                        elements_to_remove = min(count, len(value))
+                                        removed_elements = []
+                                        for _ in range(elements_to_remove):
+                                            removed_elements.append(value.pop(0))
+                                        response = encode_array(removed_elements)
                         
-                        if element is None:
-                            # Return null bulk string
-                            conn.sendall(encode_null_bulk_string())
-                        else:
-                            # Return the element as a bulk string
-                            response = encode_bulk_string(element)
-                            conn.sendall(response)
+                        conn.sendall(response)
                 else:
                     # Unknown command
                     conn.sendall(b"-ERR unknown command\r\n")
