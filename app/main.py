@@ -103,6 +103,11 @@ def encode_integer(num):
     return f":{num}\r\n".encode('utf-8')
 
 
+def encode_simple_string(s):
+    """Encode a string as a RESP simple string."""
+    return f"+{s}\r\n".encode('utf-8')
+
+
 def encode_array(elements):
     """Encode a list of strings as a RESP array."""
     if not elements:
@@ -130,6 +135,36 @@ def is_key_expired(key):
         return True
     
     return False
+
+
+def get_key_type(key):
+    """
+    Get the type of the value stored at a key.
+    Returns: "string", "list", "set", "zset", "hash", "stream", "vectorset", or "none"
+    For now, only handle "string" and "none".
+    """
+    with store_lock:
+        # Check if key has expired
+        if is_key_expired(key):
+            return "none"
+        
+        if key not in store:
+            return "none"
+        
+        value = store[key]
+        
+        if isinstance(value, str):
+            return "string"
+        elif isinstance(value, list):
+            return "list"
+        elif isinstance(value, set):
+            return "set"
+        elif isinstance(value, dict):
+            # Could be a hash or zset, for now treat as hash
+            return "hash"
+        else:
+            # Default to string for unknown types
+            return "string"
 
 
 def normalize_index(index, list_length):
@@ -273,6 +308,15 @@ def handle_client(conn, addr):
                             # Return the value as a bulk string
                             response = encode_bulk_string(value)
                             conn.sendall(response)
+                elif command == "TYPE":
+                    if len(command_parts) < 2:
+                        conn.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        key_type = get_key_type(key)
+                        # Return the type as a simple string
+                        response = encode_simple_string(key_type)
+                        conn.sendall(response)
                 elif command == "RPUSH":
                     if len(command_parts) < 3:
                         conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
