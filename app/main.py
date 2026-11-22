@@ -222,6 +222,10 @@ def parse_stream_id(stream_id_str):
     """
     Parse a stream ID string into (milliseconds_time, sequence_number).
     Returns (milliseconds_time, sequence_number) or (None, None) if invalid format.
+    
+    Handles:
+    - Explicit format: "1526919030473-0" (both parts are numbers)
+    - Auto-sequence format: "1526919030474-*" (time part is number, sequence is *)
     """
     try:
         parts = stream_id_str.split('-')
@@ -229,9 +233,15 @@ def parse_stream_id(stream_id_str):
             return None, None
         
         milliseconds_time = int(parts[0])
-        sequence_number = int(parts[1])
         
-        return milliseconds_time, sequence_number
+        # Check if sequence part is "*"
+        if parts[1] == "*":
+            # Return milliseconds_time and None to indicate auto-generation needed
+            return milliseconds_time, None
+        else:
+            # Try to parse as integer
+            sequence_number = int(parts[1])
+            return milliseconds_time, sequence_number
     except (ValueError, AttributeError):
         return None, None
 
@@ -243,43 +253,82 @@ def is_stream_id_valid(new_id_str, last_id_str=None):
     Rules:
     1. The ID must be strictly greater than 0-0 (minimum valid ID is 0-1).
     2. If there's a last ID, the new ID must be strictly greater than it.
+    3. If the sequence number is None (auto-generate case), special rules apply.
     
     Returns:
-    - (True, None) if valid
-    - (False, error_message) if invalid
+    - (True, None, final_id) if valid
+    - (False, error_message, None) if invalid
     """
     # Parse the new ID
     new_ms, new_seq = parse_stream_id(new_id_str)
     
-    if new_ms is None or new_seq is None:
-        return False, "ERR invalid stream ID"
+    if new_ms is None:
+        return False, "ERR invalid stream ID", None
     
+    # Handle auto-generation case (new_seq is None, meaning "*" was used)
+    if new_seq is None:
+        # Auto-generate the sequence number
+        if last_id_str is not None:
+            last_ms, last_seq = parse_stream_id(last_id_str)
+            
+            if last_ms is None:
+                return False, "ERR invalid last stream ID", None
+            
+            if new_ms > last_ms:
+                # Different time part, sequence starts at 0
+                final_id = f"{new_ms}-0"
+                return True, None, final_id
+            elif new_ms == last_ms:
+                # Same time part, increment sequence
+                if last_seq is None:
+                    # This shouldn't happen, but handle it
+                    return False, "ERR invalid last stream ID sequence", None
+                final_seq = last_seq + 1
+                final_id = f"{new_ms}-{final_seq}"
+                return True, None, final_id
+            else:
+                # new_ms < last_ms, invalid
+                return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item", None
+        else:
+            # No last ID, this is the first entry
+            # Special case: if time part is 0, sequence starts at 1
+            if new_ms == 0:
+                final_id = f"{new_ms}-1"
+            else:
+                final_id = f"{new_ms}-0"
+            return True, None, final_id
+    
+    # Explicit ID case (new_seq is not None)
     # Check if ID is greater than 0-0
     if new_ms == 0 and new_seq == 0:
-        return False, "ERR The ID specified in XADD must be greater than 0-0"
+        return False, "ERR The ID specified in XADD must be greater than 0-0", None
     
     # If there's a last ID, check that new ID is strictly greater
     if last_id_str is not None:
         last_ms, last_seq = parse_stream_id(last_id_str)
         
-        if last_ms is None or last_seq is None:
-            return False, "ERR invalid last stream ID"
+        if last_ms is None:
+            return False, "ERR invalid last stream ID", None
+        
+        # Handle case where last_seq is None (shouldn't happen in explicit case)
+        if last_seq is None:
+            return False, "ERR invalid last stream ID sequence", None
         
         # New ID must be strictly greater than last ID
         if new_ms > last_ms:
             # milliseconds_time is greater, so this is valid
-            return True, None
+            return True, None, new_id_str
         elif new_ms == last_ms:
             # milliseconds_time is equal, check sequence number
             if new_seq > last_seq:
-                return True, None
+                return True, None, new_id_str
             else:
-                return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item", None
         else:
             # milliseconds_time is smaller, invalid
-            return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+            return False, "ERR The ID specified in XADD is equal or smaller than the target stream top item", None
     
-    return True, None
+    return True, None, new_id_str
 
 
 def handle_client(conn, addr):
@@ -682,7 +731,7 @@ def handle_client(conn, addr):
                         conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
                     else:
                         key = command_parts[1]
-                        entry_id = command_parts[2]
+                        entry_id_input = command_parts[2]
                         
                         # Extract key-value pairs
                         kv_pairs = command_parts[3:]
@@ -721,8 +770,8 @@ def handle_client(conn, addr):
                                     # Get the ID of the last entry
                                     last_id = entries[-1]["id"]
                                 
-                                # Validate the new ID
-                                is_valid, error_msg = is_stream_id_valid(entry_id, last_id)
+                                # Validate the new ID and handle auto-generation
+                                is_valid, error_msg, final_entry_id = is_stream_id_valid(entry_id_input, last_id)
                                 
                                 if not is_valid:
                                     # ID is invalid, send error
@@ -731,7 +780,7 @@ def handle_client(conn, addr):
                                     continue
                                 
                                 # Create entry object with ID and key-value pairs
-                                entry = {"id": entry_id}
+                                entry = {"id": final_entry_id}
                                 
                                 # Add key-value pairs to entry
                                 for i in range(0, len(kv_pairs), 2):
@@ -743,7 +792,7 @@ def handle_client(conn, addr):
                                 current_value["_stream_entries"].append(entry)
                                 
                                 # Return the entry ID
-                                response = encode_bulk_string(entry_id)
+                                response = encode_bulk_string(final_entry_id)
                             else:
                                 # Key exists but is not a stream, error
                                 conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
