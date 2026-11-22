@@ -226,7 +226,13 @@ def parse_stream_id(stream_id_str):
     Handles:
     - Explicit format: "1526919030473-0" (both parts are numbers)
     - Auto-sequence format: "1526919030474-*" (time part is number, sequence is *)
+    - Full auto-generation: "*" (entire ID is auto-generated)
     """
+    # Handle full auto-generation case
+    if stream_id_str == "*":
+        # Return None, None to indicate full auto-generation needed
+        return None, None
+    
     try:
         parts = stream_id_str.split('-')
         if len(parts) != 2:
@@ -254,6 +260,7 @@ def is_stream_id_valid(new_id_str, last_id_str=None):
     1. The ID must be strictly greater than 0-0 (minimum valid ID is 0-1).
     2. If there's a last ID, the new ID must be strictly greater than it.
     3. If the sequence number is None (auto-generate case), special rules apply.
+    4. If both parts are None (full auto-generation with "*"), use current time.
     
     Returns:
     - (True, None, final_id) if valid
@@ -262,12 +269,45 @@ def is_stream_id_valid(new_id_str, last_id_str=None):
     # Parse the new ID
     new_ms, new_seq = parse_stream_id(new_id_str)
     
-    if new_ms is None:
-        return False, "ERR invalid stream ID", None
+    # Handle full auto-generation case (new_ms is None)
+    if new_ms is None and new_seq is None:
+        # Use current Unix time in milliseconds for the time part
+        # and 0 for the sequence number (unless we need to increment)
+        current_time_ms = int(time.time() * 1000)
+        
+        if last_id_str is not None:
+            last_ms, last_seq = parse_stream_id(last_id_str)
+            
+            if last_ms is None or last_seq is None:
+                # Only happens if last_id_str is "*" or invalid, shouldn't occur
+                return False, "ERR invalid last stream ID", None
+            
+            if current_time_ms > last_ms:
+                # Different time part, sequence starts at 0
+                final_id = f"{current_time_ms}-0"
+                return True, None, final_id
+            elif current_time_ms == last_ms:
+                # Same time part, increment sequence
+                final_seq = last_seq + 1
+                final_id = f"{current_time_ms}-{final_seq}"
+                return True, None, final_id
+            else:
+                # current_time_ms < last_ms, shouldn't happen in normal circumstances
+                # but if it does, use last_ms + 1
+                final_id = f"{last_ms + 1}-0"
+                return True, None, final_id
+        else:
+            # No last ID, this is the first entry
+            # Special case: if time part is 0, sequence starts at 1
+            if current_time_ms == 0:
+                final_id = f"{current_time_ms}-1"
+            else:
+                final_id = f"{current_time_ms}-0"
+            return True, None, final_id
     
-    # Handle auto-generation case (new_seq is None, meaning "*" was used)
+    # Handle auto-sequence case (new_ms is not None, new_seq is None)
     if new_seq is None:
-        # Auto-generate the sequence number
+        # Auto-generate only the sequence number
         if last_id_str is not None:
             last_ms, last_seq = parse_stream_id(last_id_str)
             
