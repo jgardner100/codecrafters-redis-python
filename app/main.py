@@ -19,7 +19,7 @@ blocked_clients = {}
 blocked_clients_lock = threading.Lock()
 
 # Dictionary to track blocked clients waiting for streams (XREAD BLOCK)
-# Format: {key: [(connection, event, timeout_end_time), ...]}
+# Format: {key: [(connection, event), ...]}
 blocked_streams = {}
 blocked_streams_lock = threading.Lock()
 
@@ -1095,17 +1095,23 @@ def handle_client(conn, addr):
                         # Format: XREAD [BLOCK milliseconds] STREAMS key1 [key2 ...] id1 [id2 ...]
                         
                         block_timeout = None
+                        has_block_keyword = False
                         streams_index = -1
                         
                         # Look for BLOCK keyword
                         for i, part in enumerate(command_parts):
                             if part.upper() == "BLOCK":
+                                has_block_keyword = True
                                 # Next argument should be the timeout in milliseconds
                                 if i + 1 < len(command_parts):
                                     try:
                                         block_timeout_ms = int(command_parts[i + 1])
                                         # Convert milliseconds to seconds for Python
-                                        block_timeout = block_timeout_ms / 1000.0
+                                        # If block_timeout_ms is 0, pass None to wait indefinitely
+                                        if block_timeout_ms == 0:
+                                            block_timeout = None
+                                        else:
+                                            block_timeout = block_timeout_ms / 1000.0
                                     except ValueError:
                                         conn.sendall(b"-ERR timeout is not an integer or out of range\r\n")
                                         break
@@ -1198,14 +1204,9 @@ def handle_client(conn, addr):
                                     # Data is available, return it immediately
                                     response = encode_streams_response(result_streams)
                                     conn.sendall(response)
-                                elif block_timeout is None:
-                                    # No data and not blocking, return null array
-                                    response = encode_null_array()
-                                    conn.sendall(response)
-                                else:
-                                    # No data available, block the client
+                                elif has_block_keyword:
+                                    # No data available, block the client if BLOCK was specified
                                     event = threading.Event()
-                                    timeout_end_time = time.time() + block_timeout
                                     
                                     # Register this client as blocked for all these keys
                                     with blocked_streams_lock:
@@ -1215,6 +1216,7 @@ def handle_client(conn, addr):
                                             blocked_streams[stream_key].append((conn, event))
                                     
                                     # Wait for the event with timeout
+                                    # If block_timeout is None, event.wait() will wait indefinitely
                                     event.wait(timeout=block_timeout)
                                     
                                     # Check if we were signaled or timed out
@@ -1283,9 +1285,24 @@ def handle_client(conn, addr):
                                                 # No data found (shouldn't normally happen), return null array
                                                 response = encode_null_array()
                                                 conn.sendall(response)
+                                            
+                                            # Clean up the blocked client registration
+                                            with blocked_streams_lock:
+                                                for stream_key in stream_keys:
+                                                    if stream_key in blocked_streams:
+                                                        # Remove this client from the blocked list
+                                                        blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
+                                                        if len(blocked_streams[stream_key]) == 0:
+                                                            del blocked_streams[stream_key]
                                             continue
                                         
                                         # If we broke out of loop, error already sent
+                                        with blocked_streams_lock:
+                                            for stream_key in stream_keys:
+                                                if stream_key in blocked_streams:
+                                                    blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
+                                                    if len(blocked_streams[stream_key]) == 0:
+                                                        del blocked_streams[stream_key]
                                         continue
                                     else:
                                         # Timeout expired, return null array
@@ -1300,7 +1317,11 @@ def handle_client(conn, addr):
                                                 blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
                                                 if len(blocked_streams[stream_key]) == 0:
                                                     del blocked_streams[stream_key]
-                                continue
+                                else:
+                                    # No data and not blocking, return null array
+                                    response = encode_null_array()
+                                    conn.sendall(response)
+                            continue
                         continue
                 else:
                     # Unknown command
