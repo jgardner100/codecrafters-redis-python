@@ -662,6 +662,40 @@ def handle_client(conn, addr):
                             # Return the value as a bulk string
                             response = encode_bulk_string(value)
                             conn.sendall(response)
+                elif command == "INCR":
+                    if len(command_parts) < 2:
+                        conn.sendall(b"-ERR wrong number of arguments for 'incr' command\r\n")
+                    else:
+                        key = command_parts[1]
+                        
+                        with store_lock:
+                            # Check if key has expired
+                            if is_key_expired(key):
+                                value = None
+                            else:
+                                value = store.get(key)
+                            
+                            if value is None:
+                                # Key does not exist, set it to 1
+                                store[key] = "1"
+                                new_value = 1
+                                expiry_times.pop(key, None)  # Remove any expiry
+                            else:
+                                # Key exists, try to increment it
+                                try:
+                                    # Convert value to integer
+                                    int_value = int(value)
+                                    new_value = int_value + 1
+                                    # Store the new value as a string
+                                    store[key] = str(new_value)
+                                except ValueError:
+                                    # Value is not a valid integer
+                                    conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                                    continue
+                        
+                        # Return the new value as an integer
+                        response = encode_integer(new_value)
+                        conn.sendall(response)
                 elif command == "TYPE":
                     if len(command_parts) < 2:
                         conn.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
