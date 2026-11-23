@@ -346,7 +346,12 @@ def parse_stream_id(stream_id_str):
     - Explicit format: "1526919030473-0" (both parts are numbers)
     - Auto-sequence format: "1526919030474-*" (time part is number, sequence is *)
     - Full auto-generation: "*" (entire ID is auto-generated)
+    - Special "$" marker for XREAD (indicates read from latest)
     """
+    # Handle special $ marker for XREAD
+    if stream_id_str == "$":
+        return "\\$", "\\$"  # Return special marker to indicate $
+    
     # Handle full auto-generation case
     if stream_id_str == "*":
         # Return None, None to indicate full auto-generation needed
@@ -555,7 +560,7 @@ def handle_client(conn, addr):
     """Handle a single client connection."""
     global active_connections
     
-    print(f"Client connected: {addr}")
+    #print(f"Client connected: {addr}")
     
     with connections_lock:
         active_connections += 1
@@ -1142,63 +1147,90 @@ def handle_client(conn, addr):
                             stream_keys = remaining_args[:num_keys]
                             stream_ids = remaining_args[num_keys:]
                             
-                            # First, try to read without blocking
-                            result_streams = []
-                            
-                            for i, stream_key in enumerate(stream_keys):
-                                read_id = stream_ids[i]
-                                
-                                # Parse the read ID
-                                try:
-                                    read_ms, read_seq = parse_stream_id(read_id)
-                                except (ValueError, AttributeError):
-                                    conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
-                                    break
-                                
-                                with store_lock:
-                                    # Check if key has expired
-                                    if is_key_expired(stream_key):
-                                        stream_value = None
-                                    else:
-                                        stream_value = store.get(stream_key)
-                                    
-                                    # If key doesn't exist or is not a stream, skip it
-                                    if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
-                                        continue
-                                    
-                                    # Get all entries
-                                    entries = stream_value["_stream_entries"]
-                                    
-                                    # Filter entries greater than the specified ID (exclusive)
-                                    filtered_entries = []
-                                    for entry in entries:
-                                        entry_id = entry["id"]
-                                        entry_ms, entry_seq = parse_stream_id(entry_id)
+                            # Resolve $ markers to actual IDs (snapshot them now)
+                            resolved_ids = []
+                            for i, read_id in enumerate(stream_ids):
+                                if read_id == "$":
+                                    # Get the last ID in the stream (if it exists)
+                                    with store_lock:
+                                        # Check if key has expired
+                                        if is_key_expired(stream_keys[i]):
+                                            stream_value = None
+                                        else:
+                                            stream_value = store.get(stream_keys[i])
                                         
-                                        # Include entries with ID > read_id
-                                        if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
-                                            # Entry ID is greater than read_id, include it
-                                            filtered_entries.append(entry)
-                                    
-                                    # Format entries for response
-                                    if filtered_entries:
-                                        response_entries = []
-                                        for entry in filtered_entries:
-                                            entry_id = entry["id"]
-                                            # Build key-value pairs list (excluding the "id" key)
-                                            kv_list = []
-                                            for key_name in sorted(entry.keys()):
-                                                if key_name != "id":
-                                                    kv_list.append(key_name)
-                                                    kv_list.append(entry[key_name])
-                                            
-                                            # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
-                                            response_entries.append([entry_id, kv_list])
-                                        
-                                        # Add to result streams
-                                        result_streams.append([stream_key, response_entries])
+                                        if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                            # Stream doesn't exist, treat as if last ID is -1
+                                            resolved_ids.append((-1, -1))
+                                        else:
+                                            # Stream exists, get the last entry ID
+                                            entries = stream_value["_stream_entries"]
+                                            if len(entries) > 0:
+                                                last_entry_id = entries[-1]["id"]
+                                                ms, seq = parse_stream_id(last_entry_id)
+                                                resolved_ids.append((ms, seq))
+                                            else:
+                                                # Stream is empty, treat as if last ID is -1
+                                                resolved_ids.append((-1, -1))
+                                else:
+                                    # Parse the read ID normally
+                                    try:
+                                        ms, seq = parse_stream_id(read_id)
+                                        resolved_ids.append((ms, seq))
+                                    except (ValueError, AttributeError):
+                                        conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
+                                        break
                             else:
-                                # Successfully processed all streams without error
+                                # Successfully resolved all IDs
+                                # First, try to read without blocking
+                                result_streams = []
+                                
+                                for i, stream_key in enumerate(stream_keys):
+                                    read_ms, read_seq = resolved_ids[i]
+                                    
+                                    with store_lock:
+                                        # Check if key has expired
+                                        if is_key_expired(stream_key):
+                                            stream_value = None
+                                        else:
+                                            stream_value = store.get(stream_key)
+                                        
+                                        # If key doesn't exist or is not a stream, skip it
+                                        if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                            continue
+                                        
+                                        # Get all entries
+                                        entries = stream_value["_stream_entries"]
+                                        
+                                        # Filter entries greater than the specified ID (exclusive)
+                                        filtered_entries = []
+                                        for entry in entries:
+                                            entry_id = entry["id"]
+                                            entry_ms, entry_seq = parse_stream_id(entry_id)
+                                            
+                                            # Include entries with ID > read_id
+                                            if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
+                                                # Entry ID is greater than read_id, include it
+                                                filtered_entries.append(entry)
+                                        
+                                        # Format entries for response
+                                        if filtered_entries:
+                                            response_entries = []
+                                            for entry in filtered_entries:
+                                                entry_id = entry["id"]
+                                                # Build key-value pairs list (excluding the "id" key)
+                                                kv_list = []
+                                                for key_name in sorted(entry.keys()):
+                                                    if key_name != "id":
+                                                        kv_list.append(key_name)
+                                                        kv_list.append(entry[key_name])
+                                                
+                                                # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
+                                                response_entries.append([entry_id, kv_list])
+                                            
+                                            # Add to result streams
+                                            result_streams.append([stream_key, response_entries])
+                                
                                 # Check if we have data or should block
                                 if result_streams:
                                     # Data is available, return it immediately
@@ -1221,18 +1253,11 @@ def handle_client(conn, addr):
                                     
                                     # Check if we were signaled or timed out
                                     if event.is_set():
-                                        # We were signaled, new data is available, read again
+                                        # We were signaled, new data is available, read again using resolved_ids
                                         result_streams = []
                                         
                                         for i, stream_key in enumerate(stream_keys):
-                                            read_id = stream_ids[i]
-                                            
-                                            # Parse the read ID
-                                            try:
-                                                read_ms, read_seq = parse_stream_id(read_id)
-                                            except (ValueError, AttributeError):
-                                                conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
-                                                break
+                                            read_ms, read_seq = resolved_ids[i]
                                             
                                             with store_lock:
                                                 # Check if key has expired
@@ -1276,34 +1301,14 @@ def handle_client(conn, addr):
                                                     
                                                     # Add to result streams
                                                     result_streams.append([stream_key, response_entries])
-                                        else:
-                                            # Successfully read after being unblocked
-                                            if result_streams:
-                                                response = encode_streams_response(result_streams)
-                                                conn.sendall(response)
-                                            else:
-                                                # No data found (shouldn't normally happen), return null array
-                                                response = encode_null_array()
-                                                conn.sendall(response)
-                                            
-                                            # Clean up the blocked client registration
-                                            with blocked_streams_lock:
-                                                for stream_key in stream_keys:
-                                                    if stream_key in blocked_streams:
-                                                        # Remove this client from the blocked list
-                                                        blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
-                                                        if len(blocked_streams[stream_key]) == 0:
-                                                            del blocked_streams[stream_key]
-                                            continue
                                         
-                                        # If we broke out of loop, error already sent
-                                        with blocked_streams_lock:
-                                            for stream_key in stream_keys:
-                                                if stream_key in blocked_streams:
-                                                    blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
-                                                    if len(blocked_streams[stream_key]) == 0:
-                                                        del blocked_streams[stream_key]
-                                        continue
+                                        if result_streams:
+                                            response = encode_streams_response(result_streams)
+                                            conn.sendall(response)
+                                        else:
+                                            # No data found, return null array
+                                            response = encode_null_array()
+                                            conn.sendall(response)
                                     else:
                                         # Timeout expired, return null array
                                         response = encode_null_array()
