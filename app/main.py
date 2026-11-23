@@ -163,6 +163,55 @@ def encode_nested_array(nested_elements):
     return response
 
 
+def encode_streams_response(streams_data):
+    """
+    Encode a streams response for XREAD.
+    
+    streams_data is a list of [stream_key, entries] pairs
+    where entries is a list of [entry_id, [k1, v1, k2, v2, ...]] pairs.
+    
+    Format:
+    *<number of streams>\r\n
+      *2\r\n
+        $<length>\r\n<stream_key>\r\n
+        *<number of entries>\r\n
+          *2\r\n
+            $<length>\r\n<entry_id>\r\n
+            *<number of kv pairs>\r\n
+              $<length>\r\n<key>\r\n
+              $<length>\r\n<value>\r\n
+              ...
+    """
+    if not streams_data:
+        return encode_null_array()
+    
+    response = b""
+    response += f"*{len(streams_data)}\r\n".encode('utf-8')
+    
+    for stream_key, entries in streams_data:
+        # Each stream is [stream_key, [entries]]
+        response += b"*2\r\n"
+        
+        # First: stream key
+        response += encode_bulk_string(stream_key)
+        
+        # Second: array of entries
+        response += f"*{len(entries)}\r\n".encode('utf-8')
+        for entry_id, kv_list in entries:
+            # Each entry is [entry_id, [k1, v1, ...]]
+            response += b"*2\r\n"
+            
+            # Entry ID
+            response += encode_bulk_string(entry_id)
+            
+            # Key-value pairs
+            response += f"*{len(kv_list)}\r\n".encode('utf-8')
+            for kv_item in kv_list:
+                response += encode_bulk_string(kv_item)
+    
+    return response
+
+
 def encode_error(error_message):
     """Encode an error message as a RESP simple error."""
     return f"-{error_message}\r\n".encode('utf-8')
@@ -1008,6 +1057,107 @@ def handle_client(conn, addr):
                                 # Encode as nested array
                                 response = encode_nested_array(response_data)
                                 conn.sendall(response)
+                elif command == "XREAD":
+                    if len(command_parts) < 4:
+                        conn.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                    else:
+                        # Parse XREAD command
+                        # Format: XREAD STREAMS key1 [key2 ...] id1 [id2 ...]
+                        # For now, we only support single stream: XREAD STREAMS key id
+                        
+                        # Find the STREAMS keyword
+                        streams_index = -1
+                        for i, part in enumerate(command_parts):
+                            if part.upper() == "STREAMS":
+                                streams_index = i
+                                break
+                        
+                        if streams_index == -1 or streams_index == len(command_parts) - 1:
+                            conn.sendall(b"-ERR syntax error\r\n")
+                            continue
+                        
+                        # Extract keys and IDs after STREAMS keyword
+                        remaining_args = command_parts[streams_index + 1:]
+                        num_args = len(remaining_args)
+                        
+                        # Number of keys and IDs must be equal
+                        if num_args % 2 != 0:
+                            conn.sendall(b"-ERR syntax error\r\n")
+                            continue
+                        
+                        num_keys = num_args // 2
+                        stream_keys = remaining_args[:num_keys]
+                        stream_ids = remaining_args[num_keys:]
+                        
+                        # Read from streams
+                        result_streams = []
+                        
+                        for i, stream_key in enumerate(stream_keys):
+                            read_id = stream_ids[i]
+                            
+                            # Parse the read ID
+                            try:
+                                read_ms, read_seq = parse_stream_id(read_id)
+                            except (ValueError, AttributeError):
+                                conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
+                                break
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(stream_key):
+                                    stream_value = None
+                                else:
+                                    stream_value = store.get(stream_key)
+                                
+                                # If key doesn't exist or is not a stream, skip it
+                                if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                    continue
+                                
+                                # Get all entries
+                                entries = stream_value["_stream_entries"]
+                                
+                                # Filter entries greater than the specified ID (exclusive)
+                                filtered_entries = []
+                                for entry in entries:
+                                    entry_id = entry["id"]
+                                    entry_ms, entry_seq = parse_stream_id(entry_id)
+                                    
+                                    # Include entries with ID > read_id
+                                    if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
+                                        # Entry ID is greater than read_id, include it
+                                        filtered_entries.append(entry)
+                                
+                                # Format entries for response
+                                if filtered_entries:
+                                    response_entries = []
+                                    for entry in filtered_entries:
+                                        entry_id = entry["id"]
+                                        # Build key-value pairs list (excluding the "id" key)
+                                        kv_list = []
+                                        for key_name in sorted(entry.keys()):
+                                            if key_name != "id":
+                                                kv_list.append(key_name)
+                                                kv_list.append(entry[key_name])
+                                        
+                                        # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
+                                        response_entries.append([entry_id, kv_list])
+                                    
+                                    # Add to result streams
+                                    result_streams.append([stream_key, response_entries])
+                        else:
+                            # Successfully processed all streams without error
+                            # Return the result
+                            if result_streams:
+                                response = encode_streams_response(result_streams)
+                                conn.sendall(response)
+                            else:
+                                # No entries found, return null array
+                                response = encode_null_array()
+                                conn.sendall(response)
+                            continue
+                        
+                        # If we broke out of loop, error already sent
+                        continue
                 else:
                     # Unknown command
                     conn.sendall(b"-ERR unknown command\r\n")
