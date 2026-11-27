@@ -615,14 +615,19 @@ def handle_client(conn, addr):
                     # Execute all queued commands
                     with transaction_states_lock:
                         in_transaction = transaction_states[conn_id]["in_transaction"]
+                        queued_commands = transaction_states[conn_id]["queued_commands"][:]
+                        # Mark transaction as complete
+                        transaction_states[conn_id]["in_transaction"] = False
+                        transaction_states[conn_id]["queued_commands"] = []
                     
                     if not in_transaction:
                         # EXEC called without MULTI
                         conn.sendall(encode_error("ERR EXEC without MULTI"))
                     else:
-                        # For now, in later stages we'll implement EXEC with MULTI
-                        # This is a placeholder for the transaction execution logic
-                        pass
+                        # Execute the queued commands and collect results
+                        # For now, with empty transactions, return empty array
+                        response = encode_array([])
+                        conn.sendall(response)
                 elif command == "SET":
                     if len(command_parts) < 3:
                         conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
