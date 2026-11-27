@@ -23,6 +23,11 @@ blocked_clients_lock = threading.Lock()
 blocked_streams = {}
 blocked_streams_lock = threading.Lock()
 
+# Dictionary to track transaction state per connection
+# Format: {connection_id: {"in_transaction": bool, "queued_commands": [...]}}
+transaction_states = {}
+transaction_states_lock = threading.Lock()
+
 # Metrics tracking
 start_time = time.time()
 active_connections = 0
@@ -565,6 +570,14 @@ def handle_client(conn, addr):
     with connections_lock:
         active_connections += 1
     
+    # Initialize transaction state for this connection
+    conn_id = id(conn)
+    with transaction_states_lock:
+        transaction_states[conn_id] = {
+            "in_transaction": False,
+            "queued_commands": []
+        }
+    
     try:
         with conn:
             while True:
@@ -592,6 +605,12 @@ def handle_client(conn, addr):
                     else:
                         # No argument provided
                         conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+                elif command == "MULTI":
+                    # Start a transaction
+                    with transaction_states_lock:
+                        transaction_states[conn_id]["in_transaction"] = True
+                        transaction_states[conn_id]["queued_commands"] = []
+                    conn.sendall(encode_simple_string("OK"))
                 elif command == "SET":
                     if len(command_parts) < 3:
                         conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
@@ -1368,6 +1387,11 @@ def handle_client(conn, addr):
     finally:
         with connections_lock:
             active_connections -= 1
+        
+        # Clean up transaction state for this connection
+        with transaction_states_lock:
+            transaction_states.pop(conn_id, None)
+        
         print(f"Client disconnected: {addr}")
 
 
