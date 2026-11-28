@@ -595,329 +595,327 @@ def handle_client(conn, addr):
                 # Get the command (case-insensitive)
                 command = command_parts[0].upper()
                 
-                if command == "PING":
-                    conn.sendall(b"+PONG\r\n")
-                elif command == "ECHO":
-                    if len(command_parts) > 1:
-                        # Send the argument as a bulk string
-                        response = encode_bulk_string(command_parts[1])
-                        conn.sendall(response)
-                    else:
-                        # No argument provided
-                        conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
-                elif command == "MULTI":
-                    # Start a transaction
-                    with transaction_states_lock:
-                        transaction_states[conn_id]["in_transaction"] = True
-                        transaction_states[conn_id]["queued_commands"] = []
-                    conn.sendall(encode_simple_string("OK"))
-                elif command == "EXEC":
-                    # Execute all queued commands
-                    with transaction_states_lock:
-                        in_transaction = transaction_states[conn_id]["in_transaction"]
-                        queued_commands = transaction_states[conn_id]["queued_commands"][:]
-                        # Mark transaction as complete
-                        transaction_states[conn_id]["in_transaction"] = False
-                        transaction_states[conn_id]["queued_commands"] = []
-                    
-                    if not in_transaction:
-                        # EXEC called without MULTI
-                        conn.sendall(encode_error("ERR EXEC without MULTI"))
-                    else:
-                        # Execute the queued commands and collect results
-                        # For now, with empty transactions, return empty array
-                        response = encode_array([])
-                        conn.sendall(response)
-                elif command == "SET":
-                    if len(command_parts) < 3:
-                        conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        value = command_parts[2]
-                        expiry_ms = None
-                        
-                        # Parse optional arguments
-                        i = 3
-                        while i < len(command_parts):
-                            option = command_parts[i].upper()
-                            if option == "EX":
-                                # Expiry in seconds
-                                if i + 1 < len(command_parts):
-                                    try:
-                                        seconds = int(command_parts[i + 1])
-                                        expiry_ms = seconds * 1000
-                                        i += 2
-                                    except ValueError:
-                                        conn.sendall(b"-ERR invalid expire time in set\r\n")
-                                        break
-                                else:
-                                    conn.sendall(b"-ERR syntax error\r\n")
-                                    break
-                            elif option == "PX":
-                                # Expiry in milliseconds
-                                if i + 1 < len(command_parts):
-                                    try:
-                                        expiry_ms = int(command_parts[i + 1])
-                                        i += 2
-                                    except ValueError:
-                                        conn.sendall(b"-ERR invalid expire time in set\r\n")
-                                        break
-                                else:
-                                    conn.sendall(b"-ERR syntax error\r\n")
-                                    break
-                            else:
-                                i += 1
-                        else:
-                            # Successfully parsed all options
-                            with store_lock:
-                                store[key] = value
-                                if expiry_ms is not None:
-                                    # Calculate absolute expiry time in milliseconds
-                                    expiry_times[key] = time.time() * 1000 + expiry_ms
-                                else:
-                                    # No expiry, remove any existing expiry
-                                    expiry_times.pop(key, None)
-                            conn.sendall(b"+OK\r\n")
-                elif command == "GET":
-                    if len(command_parts) < 2:
-                        conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        # Retrieve the value with thread safety
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
-                            else:
-                                value = store.get(key)
-                        
-                        if value is None:
-                            # Key doesn't exist, return null bulk string
-                            conn.sendall(encode_null_bulk_string())
-                        else:
-                            # Return the value as a bulk string
-                            response = encode_bulk_string(value)
+                # Check if we're in a transaction
+                with transaction_states_lock:
+                    in_transaction = transaction_states[conn_id]["in_transaction"]
+                
+                # Commands that should not be queued: MULTI, EXEC, DISCARD
+                if command in ["MULTI", "EXEC", "DISCARD"] or not in_transaction:
+                    # Process commands normally (not in transaction or special transaction commands)
+                    if command == "PING":
+                        conn.sendall(b"+PONG\r\n")
+                    elif command == "ECHO":
+                        if len(command_parts) > 1:
+                            # Send the argument as a bulk string
+                            response = encode_bulk_string(command_parts[1])
                             conn.sendall(response)
-                elif command == "INCR":
-                    if len(command_parts) < 2:
-                        conn.sendall(b"-ERR wrong number of arguments for 'incr' command\r\n")
-                    else:
-                        key = command_parts[1]
+                        else:
+                            # No argument provided
+                            conn.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+                    elif command == "MULTI":
+                        # Start a transaction
+                        with transaction_states_lock:
+                            transaction_states[conn_id]["in_transaction"] = True
+                            transaction_states[conn_id]["queued_commands"] = []
+                        conn.sendall(encode_simple_string("OK"))
+                    elif command == "EXEC":
+                        # Execute all queued commands
+                        with transaction_states_lock:
+                            in_transaction = transaction_states[conn_id]["in_transaction"]
+                            queued_commands = transaction_states[conn_id]["queued_commands"][:]
+                            # Mark transaction as complete
+                            transaction_states[conn_id]["in_transaction"] = False
+                            transaction_states[conn_id]["queued_commands"] = []
                         
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
+                        if not in_transaction:
+                            # EXEC called without MULTI
+                            conn.sendall(encode_error("ERR EXEC without MULTI"))
+                        else:
+                            # Execute the queued commands and collect results
+                            # For now, with empty transactions, return empty array
+                            response = encode_array([])
+                            conn.sendall(response)
+                    elif command == "SET":
+                        if len(command_parts) < 3:
+                            conn.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            value = command_parts[2]
+                            expiry_ms = None
+                            
+                            # Parse optional arguments
+                            i = 3
+                            while i < len(command_parts):
+                                option = command_parts[i].upper()
+                                if option == "EX":
+                                    # Expiry in seconds
+                                    if i + 1 < len(command_parts):
+                                        try:
+                                            seconds = int(command_parts[i + 1])
+                                            expiry_ms = seconds * 1000
+                                            i += 2
+                                        except ValueError:
+                                            conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                            break
+                                    else:
+                                        conn.sendall(b"-ERR syntax error\r\n")
+                                        break
+                                elif option == "PX":
+                                    # Expiry in milliseconds
+                                    if i + 1 < len(command_parts):
+                                        try:
+                                            expiry_ms = int(command_parts[i + 1])
+                                            i += 2
+                                        except ValueError:
+                                            conn.sendall(b"-ERR invalid expire time in set\r\n")
+                                            break
+                                    else:
+                                        conn.sendall(b"-ERR syntax error\r\n")
+                                        break
+                                else:
+                                    i += 1
                             else:
-                                value = store.get(key)
+                                # Successfully parsed all options
+                                with store_lock:
+                                    store[key] = value
+                                    if expiry_ms is not None:
+                                        # Calculate absolute expiry time in milliseconds
+                                        expiry_times[key] = time.time() * 1000 + expiry_ms
+                                    else:
+                                        # No expiry, remove any existing expiry
+                                        expiry_times.pop(key, None)
+                                conn.sendall(b"+OK\r\n")
+                    elif command == "GET":
+                        if len(command_parts) < 2:
+                            conn.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            # Retrieve the value with thread safety
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
+                                else:
+                                    value = store.get(key)
                             
                             if value is None:
-                                # Key does not exist, set it to 1
-                                store[key] = "1"
-                                new_value = 1
-                                expiry_times.pop(key, None)  # Remove any expiry
+                                # Key doesn't exist, return null bulk string
+                                conn.sendall(encode_null_bulk_string())
                             else:
-                                # Key exists, try to increment it
-                                try:
-                                    # Convert value to integer
-                                    int_value = int(value)
-                                    new_value = int_value + 1
-                                    # Store the new value as a string
-                                    store[key] = str(new_value)
-                                except ValueError:
-                                    # Value is not a valid integer
-                                    conn.sendall(b"-ERR value is not an integer or out of range\r\n")
-                                    continue
-                        
-                        # Return the new value as an integer
-                        response = encode_integer(new_value)
-                        conn.sendall(response)
-                elif command == "TYPE":
-                    if len(command_parts) < 2:
-                        conn.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        key_type = get_key_type(key)
-                        # Return the type as a simple string
-                        response = encode_simple_string(key_type)
-                        conn.sendall(response)
-                elif command == "RPUSH":
-                    if len(command_parts) < 3:
-                        conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        elements = command_parts[2:]
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                # Key expired, treat as non-existent
-                                store[key] = []
-                            
-                            # If key doesn't exist, create a new list
-                            if key not in store:
-                                store[key] = []
-                            
-                            # Get the current value
-                            current_value = store[key]
-                            
-                            # Check if it's a list
-                            if isinstance(current_value, list):
-                                # Append elements to the list
-                                for element in elements:
-                                    current_value.append(element)
-                                list_length = len(current_value)
-                            else:
-                                # Key exists but is not a list, error
-                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
-                                continue
-                        
-                        # Return the length of the list as an integer
-                        response = encode_integer(list_length)
-                        conn.sendall(response)
-                        
-                        # Notify blocked clients waiting for this key
-                        notify_blocked_clients(key, elements[0])
-                elif command == "LPUSH":
-                    if len(command_parts) < 3:
-                        conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        elements = command_parts[2:]
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                # Key expired, treat as non-existent
-                                store[key] = []
-                            
-                            # If key doesn't exist, create a new list
-                            if key not in store:
-                                store[key] = []
-                            
-                            # Get the current value
-                            current_value = store[key]
-                            
-                            # Check if it's a list
-                            if isinstance(current_value, list):
-                                # Prepend elements to the list
-                                # Each element is inserted at the front in order
-                                for element in elements:
-                                    current_value.insert(0, element)
-                                list_length = len(current_value)
-                            else:
-                                # Key exists but is not a list, error
-                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
-                                continue
-                        
-                        # Return the length of the list as an integer
-                        response = encode_integer(list_length)
-                        conn.sendall(response)
-                        
-                        # Notify blocked clients waiting for this key
-                        notify_blocked_clients(key, elements[0])
-                elif command == "LRANGE":
-                    if len(command_parts) < 4:
-                        conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        
-                        try:
-                            start = int(command_parts[2])
-                            stop = int(command_parts[3])
-                        except ValueError:
-                            conn.sendall(b"-ERR value is not an integer or out of range\r\n")
-                            continue
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
-                            else:
-                                value = store.get(key)
-                        
-                        # If key doesn't exist or is not a list, return empty array
-                        if value is None or not isinstance(value, list):
-                            conn.sendall(encode_array([]))
-                        else:
-                            list_data = value
-                            list_length = len(list_data)
-                            
-                            # Normalize negative indexes
-                            start = normalize_index(start, list_length)
-                            stop = normalize_index(stop, list_length)
-                            
-                            # Handle edge cases
-                            if start >= list_length or start > stop:
-                                # Return empty array
-                                conn.sendall(encode_array([]))
-                            else:
-                                # Clamp stop index to list length
-                                if stop >= list_length:
-                                    stop = list_length - 1
-                                
-                                # Extract the range
-                                result = list_data[start:stop + 1]
-                                response = encode_array(result)
+                                # Return the value as a bulk string
+                                response = encode_bulk_string(value)
                                 conn.sendall(response)
-                elif command == "LLEN":
-                    if len(command_parts) < 2:
-                        conn.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
-                            else:
-                                value = store.get(key)
-                        
-                        # If key doesn't exist or is not a list, return 0
-                        if value is None or not isinstance(value, list):
-                            response = encode_integer(0)
+                    elif command == "INCR":
+                        if len(command_parts) < 2:
+                            conn.sendall(b"-ERR wrong number of arguments for 'incr' command\r\n")
                         else:
-                            # Return the length of the list as an integer
-                            list_length = len(value)
-                            response = encode_integer(list_length)
-                        
-                        conn.sendall(response)
-                elif command == "LPOP":
-                    if len(command_parts) < 2:
-                        conn.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        count = None
-                        
-                        # Parse optional count argument
-                        if len(command_parts) >= 3:
-                            try:
-                                count = int(command_parts[2])
-                                if count < 0:
-                                    conn.sendall(b"-ERR count should be a positive integer\r\n")
+                            key = command_parts[1]
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
+                                else:
+                                    value = store.get(key)
+                                
+                                if value is None:
+                                    # Key does not exist, set it to 1
+                                    store[key] = "1"
+                                    new_value = 1
+                                    expiry_times.pop(key, None)  # Remove any expiry
+                                else:
+                                    # Key exists, try to increment it
+                                    try:
+                                        # Convert value to integer
+                                        int_value = int(value)
+                                        new_value = int_value + 1
+                                        # Store the new value as a string
+                                        store[key] = str(new_value)
+                                    except ValueError:
+                                        # Value is not a valid integer
+                                        conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                                        continue
+                            
+                            # Return the new value as an integer
+                            response = encode_integer(new_value)
+                            conn.sendall(response)
+                    elif command == "TYPE":
+                        if len(command_parts) < 2:
+                            conn.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            key_type = get_key_type(key)
+                            # Return the type as a simple string
+                            response = encode_simple_string(key_type)
+                            conn.sendall(response)
+                    elif command == "RPUSH":
+                        if len(command_parts) < 3:
+                            conn.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            elements = command_parts[2:]
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    # Key expired, treat as non-existent
+                                    store[key] = []
+                                
+                                # If key doesn't exist, create a new list
+                                if key not in store:
+                                    store[key] = []
+                                
+                                # Get the current value
+                                current_value = store[key]
+                                
+                                # Check if it's a list
+                                if isinstance(current_value, list):
+                                    # Append elements to the list
+                                    for element in elements:
+                                        current_value.append(element)
+                                    list_length = len(current_value)
+                                else:
+                                    # Key exists but is not a list, error
+                                    conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
                                     continue
+                            
+                            # Return the length of the list as an integer
+                            response = encode_integer(list_length)
+                            conn.sendall(response)
+                            
+                            # Notify blocked clients waiting for this key
+                            notify_blocked_clients(key, elements[0])
+                    elif command == "LPUSH":
+                        if len(command_parts) < 3:
+                            conn.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            elements = command_parts[2:]
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    # Key expired, treat as non-existent
+                                    store[key] = []
+                                
+                                # If key doesn't exist, create a new list
+                                if key not in store:
+                                    store[key] = []
+                                
+                                # Get the current value
+                                current_value = store[key]
+                                
+                                # Check if it's a list
+                                if isinstance(current_value, list):
+                                    # Prepend elements to the list
+                                    # Each element is inserted at the front in order
+                                    for element in elements:
+                                        current_value.insert(0, element)
+                                    list_length = len(current_value)
+                                else:
+                                    # Key exists but is not a list, error
+                                    conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                    continue
+                            
+                            # Return the length of the list as an integer
+                            response = encode_integer(list_length)
+                            conn.sendall(response)
+                            
+                            # Notify blocked clients waiting for this key
+                            notify_blocked_clients(key, elements[0])
+                    elif command == "LRANGE":
+                        if len(command_parts) < 4:
+                            conn.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            
+                            try:
+                                start = int(command_parts[2])
+                                stop = int(command_parts[3])
                             except ValueError:
                                 conn.sendall(b"-ERR value is not an integer or out of range\r\n")
                                 continue
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
-                            else:
-                                value = store.get(key)
                             
-                            # If key doesn't exist or is not a list
-                            if value is None or not isinstance(value, list):
-                                if count is None:
-                                    # No count specified: return null bulk string
-                                    response = encode_null_bulk_string()
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
                                 else:
-                                    # Count specified: return empty array
-                                    response = encode_array([])
+                                    value = store.get(key)
+                            
+                            # If key doesn't exist or is not a list, return empty array
+                            if value is None or not isinstance(value, list):
+                                conn.sendall(encode_array([]))
                             else:
-                                # List exists
-                                if len(value) == 0:
+                                list_data = value
+                                list_length = len(list_data)
+                                
+                                # Normalize negative indexes
+                                start = normalize_index(start, list_length)
+                                stop = normalize_index(stop, list_length)
+                                
+                                # Handle edge cases
+                                if start >= list_length or start > stop:
+                                    # Return empty array
+                                    conn.sendall(encode_array([]))
+                                else:
+                                    # Clamp stop index to list length
+                                    if stop >= list_length:
+                                        stop = list_length - 1
+                                    
+                                    # Extract the range
+                                    result = list_data[start:stop + 1]
+                                    response = encode_array(result)
+                                    conn.sendall(response)
+                    elif command == "LLEN":
+                        if len(command_parts) < 2:
+                            conn.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
+                                else:
+                                    value = store.get(key)
+                            
+                            # If key doesn't exist or is not a list, return 0
+                            if value is None or not isinstance(value, list):
+                                response = encode_integer(0)
+                            else:
+                                # Return the length of the list as an integer
+                                list_length = len(value)
+                                response = encode_integer(list_length)
+                            
+                            conn.sendall(response)
+                    elif command == "LPOP":
+                        if len(command_parts) < 2:
+                            conn.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            count = None
+                            
+                            # Parse optional count argument
+                            if len(command_parts) >= 3:
+                                try:
+                                    count = int(command_parts[2])
+                                    if count < 0:
+                                        conn.sendall(b"-ERR count should be a positive integer\r\n")
+                                        continue
+                                except ValueError:
+                                    conn.sendall(b"-ERR value is not an integer or out of range\r\n")
+                                    continue
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
+                                else:
+                                    value = store.get(key)
+                                
+                                # If key doesn't exist or is not a list
+                                if value is None or not isinstance(value, list):
                                     if count is None:
                                         # No count specified: return null bulk string
                                         response = encode_null_bulk_string()
@@ -925,482 +923,497 @@ def handle_client(conn, addr):
                                         # Count specified: return empty array
                                         response = encode_array([])
                                 else:
-                                    if count is None:
-                                        # No count specified: remove and return single element
-                                        element = value.pop(0)
-                                        response = encode_bulk_string(element)
+                                    # List exists
+                                    if len(value) == 0:
+                                        if count is None:
+                                            # No count specified: return null bulk string
+                                            response = encode_null_bulk_string()
+                                        else:
+                                            # Count specified: return empty array
+                                            response = encode_array([])
                                     else:
-                                        # Count specified: remove and return multiple elements
-                                        # Remove up to count elements from the front
-                                        elements_to_remove = min(count, len(value))
-                                        removed_elements = []
-                                        for _ in range(elements_to_remove):
-                                            removed_elements.append(value.pop(0))
-                                        response = encode_array(removed_elements)
-                        
-                        conn.sendall(response)
-                elif command == "BLPOP":
-                    if len(command_parts) < 3:
-                        conn.sendall(b"-ERR wrong number of arguments for 'blpop' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        
-                        # Parse timeout as a float to support decimal values like 0.5, 0.1
-                        try:
-                            timeout = float(command_parts[2])
-                        except ValueError:
-                            conn.sendall(b"-ERR timeout is not a float or out of range\r\n")
-                            continue
-                        
-                        # Try to pop an element immediately
-                        element = None
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                value = None
-                            else:
-                                value = store.get(key)
+                                        if count is None:
+                                            # No count specified: remove and return single element
+                                            element = value.pop(0)
+                                            response = encode_bulk_string(element)
+                                        else:
+                                            # Count specified: remove and return multiple elements
+                                            # Remove up to count elements from the front
+                                            elements_to_remove = min(count, len(value))
+                                            removed_elements = []
+                                            for _ in range(elements_to_remove):
+                                                removed_elements.append(value.pop(0))
+                                            response = encode_array(removed_elements)
                             
-                            # If key exists and is a non-empty list
-                            if value is not None and isinstance(value, list) and len(value) > 0:
-                                element = value.pop(0)
-                        
-                        if element is not None:
-                            # Element was available, return it immediately
-                            response = encode_array([key, element])
                             conn.sendall(response)
+                    elif command == "BLPOP":
+                        if len(command_parts) < 3:
+                            conn.sendall(b"-ERR wrong number of arguments for 'blpop' command\r\n")
                         else:
-                            # No element available, block the client
-                            event = threading.Event()
+                            key = command_parts[1]
                             
-                            # Register this client as blocked for this key
-                            with blocked_clients_lock:
-                                if key not in blocked_clients:
-                                    blocked_clients[key] = []
-                                blocked_clients[key].append((conn, event))
+                            # Parse timeout as a float to support decimal values like 0.5, 0.1
+                            try:
+                                timeout = float(command_parts[2])
+                            except ValueError:
+                                conn.sendall(b"-ERR timeout is not a float or out of range\r\n")
+                                continue
                             
-                            # Wait for the event to be signaled (with timeout if specified)
-                            # timeout 0 means wait indefinitely
-                            if timeout == 0:
-                                event.wait()
-                            else:
-                                event.wait(timeout=timeout)
-                            
-                            # Check if we were signaled or timed out
-                            if event.is_set():
-                                # We were signaled, an element is available
-                                with store_lock:
-                                    # Check if key has expired
-                                    if is_key_expired(key):
-                                        value = None
-                                    else:
-                                        value = store.get(key)
-                                    
-                                    # Pop the element
-                                    if value is not None and isinstance(value, list) and len(value) > 0:
-                                        element = value.pop(0)
-                                    else:
-                                        element = None
-                                
-                                if element is not None:
-                                    response = encode_array([key, element])
-                                    conn.sendall(response)
+                            # Try to pop an element immediately
+                            element = None
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    value = None
                                 else:
-                                    # This shouldn't happen, but handle it gracefully
-                                    response = encode_null_array()
-                                    conn.sendall(response)
-                            else:
-                                # Timeout reached, return null array
-                                response = encode_null_array()
+                                    value = store.get(key)
+                                
+                                # If key exists and is a non-empty list
+                                if value is not None and isinstance(value, list) and len(value) > 0:
+                                    element = value.pop(0)
+                            
+                            if element is not None:
+                                # Element was available, return it immediately
+                                response = encode_array([key, element])
                                 conn.sendall(response)
-                            
-                            # Clean up the blocked client registration
-                            with blocked_clients_lock:
-                                if key in blocked_clients:
-                                    # Remove this client from the blocked list if it's still there
-                                    blocked_clients[key] = [(c, e) for c, e in blocked_clients[key] if e is not event]
-                                    if len(blocked_clients[key]) == 0:
-                                        del blocked_clients[key]
-                elif command == "XADD":
-                    if len(command_parts) < 4:
-                        conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        entry_id_input = command_parts[2]
-                        
-                        # Extract key-value pairs
-                        kv_pairs = command_parts[3:]
-                        
-                        # Validate that we have an even number of arguments for key-value pairs
-                        if len(kv_pairs) % 2 != 0:
-                            conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
-                            continue
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                # Key expired, treat as non-existent
-                                stream_data = {
-                                    "_stream_entries": []
-                                }
-                                store[key] = stream_data
-                            
-                            # If key doesn't exist, create a new stream
-                            if key not in store:
-                                stream_data = {
-                                    "_stream_entries": []
-                                }
-                                store[key] = stream_data
-                            
-                            # Get the current value
-                            current_value = store[key]
-                            
-                            # Check if it's a stream
-                            if isinstance(current_value, dict) and "_stream_entries" in current_value:
-                                # Validate the entry ID
-                                entries = current_value["_stream_entries"]
-                                last_id = None
-                                
-                                if len(entries) > 0:
-                                    # Get the ID of the last entry
-                                    last_id = entries[-1]["id"]
-                                
-                                # Validate the new ID and handle auto-generation
-                                is_valid, error_msg, final_entry_id = is_stream_id_valid(entry_id_input, last_id)
-                                
-                                if not is_valid:
-                                    # ID is invalid, send error
-                                    error_response = encode_error(error_msg)
-                                    conn.sendall(error_response)
-                                    continue
-                                
-                                # Create entry object with ID and key-value pairs
-                                entry = {"id": final_entry_id}
-                                
-                                # Add key-value pairs to entry
-                                for i in range(0, len(kv_pairs), 2):
-                                    entry_key = kv_pairs[i]
-                                    entry_value = kv_pairs[i + 1]
-                                    entry[entry_key] = entry_value
-                                
-                                # Add entry to stream
-                                current_value["_stream_entries"].append(entry)
-                                
-                                # Return the entry ID
-                                response = encode_bulk_string(final_entry_id)
                             else:
-                                # Key exists but is not a stream, error
-                                conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
-                                continue
-                        
-                        conn.sendall(response)
-                        
-                        # Notify blocked clients waiting for this stream
-                        notify_blocked_streams(key)
-                elif command == "XRANGE":
-                    if len(command_parts) < 4:
-                        conn.sendall(b"-ERR wrong number of arguments for 'xrange' command\r\n")
-                    else:
-                        key = command_parts[1]
-                        start_id_str = command_parts[2]
-                        end_id_str = command_parts[3]
-                        
-                        try:
-                            # Parse start ID (default sequence to 0 if omitted)
-                            start_ms, start_seq = parse_range_id(start_id_str)
-                            if start_seq is None:
-                                start_seq = 0
-                            
-                            # Parse end ID (default sequence to max if omitted)
-                            end_ms, end_seq = parse_range_id(end_id_str)
-                            if end_seq is None:
-                                end_seq = 2**63 - 1  # Maximum possible sequence number
-                        except ValueError as e:
-                            conn.sendall(encode_error(f"ERR {str(e)}"))
-                            continue
-                        
-                        with store_lock:
-                            # Check if key has expired
-                            if is_key_expired(key):
-                                stream_value = None
-                            else:
-                                stream_value = store.get(key)
-                            
-                            # If key doesn't exist or is not a stream, return empty array
-                            if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
-                                conn.sendall(encode_array([]))
-                            else:
-                                # Get all entries
-                                entries = stream_value["_stream_entries"]
+                                # No element available, block the client
+                                event = threading.Event()
                                 
-                                # Filter entries within the range
-                                range_entries = []
-                                for entry in entries:
-                                    entry_id = entry["id"]
-                                    entry_ms, entry_seq = parse_stream_id(entry_id)
-                                    
-                                    # Check if entry ID is within range [start, end]
-                                    if compare_stream_ids(entry_ms, entry_seq, start_ms, start_seq) >= 0 and \
-                                       compare_stream_ids(entry_ms, entry_seq, end_ms, end_seq) <= 0:
-                                        # Entry is within range, include it
-                                        range_entries.append(entry)
+                                # Register this client as blocked for this key
+                                with blocked_clients_lock:
+                                    if key not in blocked_clients:
+                                        blocked_clients[key] = []
+                                    blocked_clients[key].append((conn, event))
                                 
-                                # Format response as nested array
-                                response_data = []
-                                for entry in range_entries:
-                                    entry_id = entry["id"]
-                                    # Build key-value pairs list (excluding the "id" key)
-                                    kv_list = []
-                                    for key_name in sorted(entry.keys()):
-                                        if key_name != "id":
-                                            kv_list.append(key_name)
-                                            kv_list.append(entry[key_name])
-                                    
-                                    # Each entry is [id, [k1, v1, k2, v2, ...]]
-                                    response_data.append([entry_id, kv_list])
-                                
-                                # Encode as nested array
-                                response = encode_nested_array(response_data)
-                                conn.sendall(response)
-                elif command == "XREAD":
-                    if len(command_parts) < 4:
-                        conn.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
-                    else:
-                        # Parse XREAD command
-                        # Format: XREAD [BLOCK milliseconds] STREAMS key1 [key2 ...] id1 [id2 ...]
-                        
-                        block_timeout = None
-                        has_block_keyword = False
-                        streams_index = -1
-                        
-                        # Look for BLOCK keyword
-                        for i, part in enumerate(command_parts):
-                            if part.upper() == "BLOCK":
-                                has_block_keyword = True
-                                # Next argument should be the timeout in milliseconds
-                                if i + 1 < len(command_parts):
-                                    try:
-                                        block_timeout_ms = int(command_parts[i + 1])
-                                        # Convert milliseconds to seconds for Python
-                                        # If block_timeout_ms is 0, pass None to wait indefinitely
-                                        if block_timeout_ms == 0:
-                                            block_timeout = None
-                                        else:
-                                            block_timeout = block_timeout_ms / 1000.0
-                                    except ValueError:
-                                        conn.sendall(b"-ERR timeout is not an integer or out of range\r\n")
-                                        break
+                                # Wait for the event to be signaled (with timeout if specified)
+                                # timeout 0 means wait indefinitely
+                                if timeout == 0:
+                                    event.wait()
                                 else:
-                                    conn.sendall(b"-ERR syntax error\r\n")
-                                    break
-                        else:
-                            # Find the STREAMS keyword
-                            for i, part in enumerate(command_parts):
-                                if part.upper() == "STREAMS":
-                                    streams_index = i
-                                    break
-                            
-                            if streams_index == -1 or streams_index == len(command_parts) - 1:
-                                conn.sendall(b"-ERR syntax error\r\n")
-                                continue
-                            
-                            # Extract keys and IDs after STREAMS keyword
-                            remaining_args = command_parts[streams_index + 1:]
-                            num_args = len(remaining_args)
-                            
-                            # Number of keys and IDs must be equal
-                            if num_args % 2 != 0:
-                                conn.sendall(b"-ERR syntax error\r\n")
-                                continue
-                            
-                            num_keys = num_args // 2
-                            stream_keys = remaining_args[:num_keys]
-                            stream_ids = remaining_args[num_keys:]
-                            
-                            # Resolve $ markers to actual IDs (snapshot them now)
-                            resolved_ids = []
-                            for i, read_id in enumerate(stream_ids):
-                                if read_id == "$":
-                                    # Get the last ID in the stream (if it exists)
+                                    event.wait(timeout=timeout)
+                                
+                                # Check if we were signaled or timed out
+                                if event.is_set():
+                                    # We were signaled, an element is available
                                     with store_lock:
                                         # Check if key has expired
-                                        if is_key_expired(stream_keys[i]):
-                                            stream_value = None
+                                        if is_key_expired(key):
+                                            value = None
                                         else:
-                                            stream_value = store.get(stream_keys[i])
+                                            value = store.get(key)
                                         
-                                        if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
-                                            # Stream doesn't exist, treat as if last ID is -1
-                                            resolved_ids.append((-1, -1))
+                                        # Pop the element
+                                        if value is not None and isinstance(value, list) and len(value) > 0:
+                                            element = value.pop(0)
                                         else:
-                                            # Stream exists, get the last entry ID
-                                            entries = stream_value["_stream_entries"]
-                                            if len(entries) > 0:
-                                                last_entry_id = entries[-1]["id"]
-                                                ms, seq = parse_stream_id(last_entry_id)
-                                                resolved_ids.append((ms, seq))
-                                            else:
-                                                # Stream is empty, treat as if last ID is -1
-                                                resolved_ids.append((-1, -1))
-                                else:
-                                    # Parse the read ID normally
-                                    try:
-                                        ms, seq = parse_stream_id(read_id)
-                                        resolved_ids.append((ms, seq))
-                                    except (ValueError, AttributeError):
-                                        conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
-                                        break
-                            else:
-                                # Successfully resolved all IDs
-                                # First, try to read without blocking
-                                result_streams = []
-                                
-                                for i, stream_key in enumerate(stream_keys):
-                                    read_ms, read_seq = resolved_ids[i]
+                                            element = None
                                     
-                                    with store_lock:
-                                        # Check if key has expired
-                                        if is_key_expired(stream_key):
-                                            stream_value = None
-                                        else:
-                                            stream_value = store.get(stream_key)
-                                        
-                                        # If key doesn't exist or is not a stream, skip it
-                                        if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
-                                            continue
-                                        
-                                        # Get all entries
-                                        entries = stream_value["_stream_entries"]
-                                        
-                                        # Filter entries greater than the specified ID (exclusive)
-                                        filtered_entries = []
-                                        for entry in entries:
-                                            entry_id = entry["id"]
-                                            entry_ms, entry_seq = parse_stream_id(entry_id)
-                                            
-                                            # Include entries with ID > read_id
-                                            if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
-                                                # Entry ID is greater than read_id, include it
-                                                filtered_entries.append(entry)
-                                        
-                                        # Format entries for response
-                                        if filtered_entries:
-                                            response_entries = []
-                                            for entry in filtered_entries:
-                                                entry_id = entry["id"]
-                                                # Build key-value pairs list (excluding the "id" key)
-                                                kv_list = []
-                                                for key_name in sorted(entry.keys()):
-                                                    if key_name != "id":
-                                                        kv_list.append(key_name)
-                                                        kv_list.append(entry[key_name])
-                                                
-                                                # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
-                                                response_entries.append([entry_id, kv_list])
-                                            
-                                            # Add to result streams
-                                            result_streams.append([stream_key, response_entries])
-                                
-                                # Check if we have data or should block
-                                if result_streams:
-                                    # Data is available, return it immediately
-                                    response = encode_streams_response(result_streams)
-                                    conn.sendall(response)
-                                elif has_block_keyword:
-                                    # No data available, block the client if BLOCK was specified
-                                    event = threading.Event()
-                                    
-                                    # Register this client as blocked for all these keys
-                                    with blocked_streams_lock:
-                                        for stream_key in stream_keys:
-                                            if stream_key not in blocked_streams:
-                                                blocked_streams[stream_key] = []
-                                            blocked_streams[stream_key].append((conn, event))
-                                    
-                                    # Wait for the event with timeout
-                                    # If block_timeout is None, event.wait() will wait indefinitely
-                                    event.wait(timeout=block_timeout)
-                                    
-                                    # Check if we were signaled or timed out
-                                    if event.is_set():
-                                        # We were signaled, new data is available, read again using resolved_ids
-                                        result_streams = []
-                                        
-                                        for i, stream_key in enumerate(stream_keys):
-                                            read_ms, read_seq = resolved_ids[i]
-                                            
-                                            with store_lock:
-                                                # Check if key has expired
-                                                if is_key_expired(stream_key):
-                                                    stream_value = None
-                                                else:
-                                                    stream_value = store.get(stream_key)
-                                                
-                                                # If key doesn't exist or is not a stream, skip it
-                                                if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
-                                                    continue
-                                                
-                                                # Get all entries
-                                                entries = stream_value["_stream_entries"]
-                                                
-                                                # Filter entries greater than the specified ID (exclusive)
-                                                filtered_entries = []
-                                                for entry in entries:
-                                                    entry_id = entry["id"]
-                                                    entry_ms, entry_seq = parse_stream_id(entry_id)
-                                                    
-                                                    # Include entries with ID > read_id
-                                                    if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
-                                                        # Entry ID is greater than read_id, include it
-                                                        filtered_entries.append(entry)
-                                                
-                                                # Format entries for response
-                                                if filtered_entries:
-                                                    response_entries = []
-                                                    for entry in filtered_entries:
-                                                        entry_id = entry["id"]
-                                                        # Build key-value pairs list (excluding the "id" key)
-                                                        kv_list = []
-                                                        for key_name in sorted(entry.keys()):
-                                                            if key_name != "id":
-                                                                kv_list.append(key_name)
-                                                                kv_list.append(entry[key_name])
-                                                        
-                                                        # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
-                                                        response_entries.append([entry_id, kv_list])
-                                                    
-                                                    # Add to result streams
-                                                    result_streams.append([stream_key, response_entries])
-                                        
-                                        if result_streams:
-                                            response = encode_streams_response(result_streams)
-                                            conn.sendall(response)
-                                        else:
-                                            # No data found, return null array
-                                            response = encode_null_array()
-                                            conn.sendall(response)
+                                    if element is not None:
+                                        response = encode_array([key, element])
+                                        conn.sendall(response)
                                     else:
-                                        # Timeout expired, return null array
+                                        # This shouldn't happen, but handle it gracefully
                                         response = encode_null_array()
                                         conn.sendall(response)
-                                    
-                                    # Clean up the blocked client registration
-                                    with blocked_streams_lock:
-                                        for stream_key in stream_keys:
-                                            if stream_key in blocked_streams:
-                                                # Remove this client from the blocked list
-                                                blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
-                                                if len(blocked_streams[stream_key]) == 0:
-                                                    del blocked_streams[stream_key]
                                 else:
-                                    # No data and not blocking, return null array
+                                    # Timeout reached, return null array
                                     response = encode_null_array()
                                     conn.sendall(response)
+                                
+                                # Clean up the blocked client registration
+                                with blocked_clients_lock:
+                                    if key in blocked_clients:
+                                        # Remove this client from the blocked list if it's still there
+                                        blocked_clients[key] = [(c, e) for c, e in blocked_clients[key] if e is not event]
+                                        if len(blocked_clients[key]) == 0:
+                                            del blocked_clients[key]
+                    elif command == "XADD":
+                        if len(command_parts) < 4:
+                            conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            entry_id_input = command_parts[2]
+                            
+                            # Extract key-value pairs
+                            kv_pairs = command_parts[3:]
+                            
+                            # Validate that we have an even number of arguments for key-value pairs
+                            if len(kv_pairs) % 2 != 0:
+                                conn.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                                continue
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    # Key expired, treat as non-existent
+                                    stream_data = {
+                                        "_stream_entries": []
+                                    }
+                                    store[key] = stream_data
+                                
+                                # If key doesn't exist, create a new stream
+                                if key not in store:
+                                    stream_data = {
+                                        "_stream_entries": []
+                                    }
+                                    store[key] = stream_data
+                                
+                                # Get the current value
+                                current_value = store[key]
+                                
+                                # Check if it's a stream
+                                if isinstance(current_value, dict) and "_stream_entries" in current_value:
+                                    # Validate the entry ID
+                                    entries = current_value["_stream_entries"]
+                                    last_id = None
+                                    
+                                    if len(entries) > 0:
+                                        # Get the ID of the last entry
+                                        last_id = entries[-1]["id"]
+                                    
+                                    # Validate the new ID and handle auto-generation
+                                    is_valid, error_msg, final_entry_id = is_stream_id_valid(entry_id_input, last_id)
+                                    
+                                    if not is_valid:
+                                        # ID is invalid, send error
+                                        error_response = encode_error(error_msg)
+                                        conn.sendall(error_response)
+                                        continue
+                                    
+                                    # Create entry object with ID and key-value pairs
+                                    entry = {"id": final_entry_id}
+                                    
+                                    # Add key-value pairs to entry
+                                    for i in range(0, len(kv_pairs), 2):
+                                        entry_key = kv_pairs[i]
+                                        entry_value = kv_pairs[i + 1]
+                                        entry[entry_key] = entry_value
+                                    
+                                    # Add entry to stream
+                                    current_value["_stream_entries"].append(entry)
+                                    
+                                    # Return the entry ID
+                                    response = encode_bulk_string(final_entry_id)
+                                else:
+                                    # Key exists but is not a stream, error
+                                    conn.sendall(b"-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                    continue
+                            
+                            conn.sendall(response)
+                            
+                            # Notify blocked clients waiting for this stream
+                            notify_blocked_streams(key)
+                    elif command == "XRANGE":
+                        if len(command_parts) < 4:
+                            conn.sendall(b"-ERR wrong number of arguments for 'xrange' command\r\n")
+                        else:
+                            key = command_parts[1]
+                            start_id_str = command_parts[2]
+                            end_id_str = command_parts[3]
+                            
+                            try:
+                                # Parse start ID (default sequence to 0 if omitted)
+                                start_ms, start_seq = parse_range_id(start_id_str)
+                                if start_seq is None:
+                                    start_seq = 0
+                                
+                                # Parse end ID (default sequence to max if omitted)
+                                end_ms, end_seq = parse_range_id(end_id_str)
+                                if end_seq is None:
+                                    end_seq = 2**63 - 1  # Maximum possible sequence number
+                            except ValueError as e:
+                                conn.sendall(encode_error(f"ERR {str(e)}"))
+                                continue
+                            
+                            with store_lock:
+                                # Check if key has expired
+                                if is_key_expired(key):
+                                    stream_value = None
+                                else:
+                                    stream_value = store.get(key)
+                                
+                                # If key doesn't exist or is not a stream, return empty array
+                                if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                    conn.sendall(encode_array([]))
+                                else:
+                                    # Get all entries
+                                    entries = stream_value["_stream_entries"]
+                                    
+                                    # Filter entries within the range
+                                    range_entries = []
+                                    for entry in entries:
+                                        entry_id = entry["id"]
+                                        entry_ms, entry_seq = parse_stream_id(entry_id)
+                                        
+                                        # Check if entry ID is within range [start, end]
+                                        if compare_stream_ids(entry_ms, entry_seq, start_ms, start_seq) >= 0 and \
+                                           compare_stream_ids(entry_ms, entry_seq, end_ms, end_seq) <= 0:
+                                            # Entry is within range, include it
+                                            range_entries.append(entry)
+                                    
+                                    # Format response as nested array
+                                    response_data = []
+                                    for entry in range_entries:
+                                        entry_id = entry["id"]
+                                        # Build key-value pairs list (excluding the "id" key)
+                                        kv_list = []
+                                        for key_name in sorted(entry.keys()):
+                                            if key_name != "id":
+                                                kv_list.append(key_name)
+                                                kv_list.append(entry[key_name])
+                                        
+                                        # Each entry is [id, [k1, v1, k2, v2, ...]]
+                                        response_data.append([entry_id, kv_list])
+                                    
+                                    # Encode as nested array
+                                    response = encode_nested_array(response_data)
+                                    conn.sendall(response)
+                    elif command == "XREAD":
+                        if len(command_parts) < 4:
+                            conn.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                        else:
+                            # Parse XREAD command
+                            # Format: XREAD [BLOCK milliseconds] STREAMS key1 [key2 ...] id1 [id2 ...]
+                            
+                            block_timeout = None
+                            has_block_keyword = False
+                            streams_index = -1
+                            
+                            # Look for BLOCK keyword
+                            for i, part in enumerate(command_parts):
+                                if part.upper() == "BLOCK":
+                                    has_block_keyword = True
+                                    # Next argument should be the timeout in milliseconds
+                                    if i + 1 < len(command_parts):
+                                        try:
+                                            block_timeout_ms = int(command_parts[i + 1])
+                                            # Convert milliseconds to seconds for Python
+                                            # If block_timeout_ms is 0, pass None to wait indefinitely
+                                            if block_timeout_ms == 0:
+                                                block_timeout = None
+                                            else:
+                                                block_timeout = block_timeout_ms / 1000.0
+                                        except ValueError:
+                                            conn.sendall(b"-ERR timeout is not an integer or out of range\r\n")
+                                            break
+                                    else:
+                                        conn.sendall(b"-ERR syntax error\r\n")
+                                        break
+                            else:
+                                # Find the STREAMS keyword
+                                for i, part in enumerate(command_parts):
+                                    if part.upper() == "STREAMS":
+                                        streams_index = i
+                                        break
+                                
+                                if streams_index == -1 or streams_index == len(command_parts) - 1:
+                                    conn.sendall(b"-ERR syntax error\r\n")
+                                    continue
+                                
+                                # Extract keys and IDs after STREAMS keyword
+                                remaining_args = command_parts[streams_index + 1:]
+                                num_args = len(remaining_args)
+                                
+                                # Number of keys and IDs must be equal
+                                if num_args % 2 != 0:
+                                    conn.sendall(b"-ERR syntax error\r\n")
+                                    continue
+                                
+                                num_keys = num_args // 2
+                                stream_keys = remaining_args[:num_keys]
+                                stream_ids = remaining_args[num_keys:]
+                                
+                                # Resolve $ markers to actual IDs (snapshot them now)
+                                resolved_ids = []
+                                for i, read_id in enumerate(stream_ids):
+                                    if read_id == "$":
+                                        # Get the last ID in the stream (if it exists)
+                                        with store_lock:
+                                            # Check if key has expired
+                                            if is_key_expired(stream_keys[i]):
+                                                stream_value = None
+                                            else:
+                                                stream_value = store.get(stream_keys[i])
+                                            
+                                            if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                                # Stream doesn't exist, treat as if last ID is -1
+                                                resolved_ids.append((-1, -1))
+                                            else:
+                                                # Stream exists, get the last entry ID
+                                                entries = stream_value["_stream_entries"]
+                                                if len(entries) > 0:
+                                                    last_entry_id = entries[-1]["id"]
+                                                    ms, seq = parse_stream_id(last_entry_id)
+                                                    resolved_ids.append((ms, seq))
+                                                else:
+                                                    # Stream is empty, treat as if last ID is -1
+                                                    resolved_ids.append((-1, -1))
+                                    else:
+                                        # Parse the read ID normally
+                                        try:
+                                            ms, seq = parse_stream_id(read_id)
+                                            resolved_ids.append((ms, seq))
+                                        except (ValueError, AttributeError):
+                                            conn.sendall(encode_error("ERR Invalid stream ID specified as stream argument"))
+                                            break
+                                else:
+                                    # Successfully resolved all IDs
+                                    # First, try to read without blocking
+                                    result_streams = []
+                                    
+                                    for i, stream_key in enumerate(stream_keys):
+                                        read_ms, read_seq = resolved_ids[i]
+                                        
+                                        with store_lock:
+                                            # Check if key has expired
+                                            if is_key_expired(stream_key):
+                                                stream_value = None
+                                            else:
+                                                stream_value = store.get(stream_key)
+                                            
+                                            # If key doesn't exist or is not a stream, skip it
+                                            if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                                continue
+                                            
+                                            # Get all entries
+                                            entries = stream_value["_stream_entries"]
+                                            
+                                            # Filter entries greater than the specified ID (exclusive)
+                                            filtered_entries = []
+                                            for entry in entries:
+                                                entry_id = entry["id"]
+                                                entry_ms, entry_seq = parse_stream_id(entry_id)
+                                                
+                                                # Include entries with ID > read_id
+                                                if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
+                                                    # Entry ID is greater than read_id, include it
+                                                    filtered_entries.append(entry)
+                                            
+                                            # Format entries for response
+                                            if filtered_entries:
+                                                response_entries = []
+                                                for entry in filtered_entries:
+                                                    entry_id = entry["id"]
+                                                    # Build key-value pairs list (excluding the "id" key)
+                                                    kv_list = []
+                                                    for key_name in sorted(entry.keys()):
+                                                        if key_name != "id":
+                                                            kv_list.append(key_name)
+                                                            kv_list.append(entry[key_name])
+                                                    
+                                                    # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
+                                                    response_entries.append([entry_id, kv_list])
+                                                
+                                                # Add to result streams
+                                                result_streams.append([stream_key, response_entries])
+                                    
+                                    # Check if we have data or should block
+                                    if result_streams:
+                                        # Data is available, return it immediately
+                                        response = encode_streams_response(result_streams)
+                                        conn.sendall(response)
+                                    elif has_block_keyword:
+                                        # No data available, block the client if BLOCK was specified
+                                        event = threading.Event()
+                                        
+                                        # Register this client as blocked for all these keys
+                                        with blocked_streams_lock:
+                                            for stream_key in stream_keys:
+                                                if stream_key not in blocked_streams:
+                                                    blocked_streams[stream_key] = []
+                                                blocked_streams[stream_key].append((conn, event))
+                                        
+                                        # Wait for the event with timeout
+                                        # If block_timeout is None, event.wait() will wait indefinitely
+                                        event.wait(timeout=block_timeout)
+                                        
+                                        # Check if we were signaled or timed out
+                                        if event.is_set():
+                                            # We were signaled, new data is available, read again using resolved_ids
+                                            result_streams = []
+                                            
+                                            for i, stream_key in enumerate(stream_keys):
+                                                read_ms, read_seq = resolved_ids[i]
+                                                
+                                                with store_lock:
+                                                    # Check if key has expired
+                                                    if is_key_expired(stream_key):
+                                                        stream_value = None
+                                                    else:
+                                                        stream_value = store.get(stream_key)
+                                                    
+                                                    # If key doesn't exist or is not a stream, skip it
+                                                    if stream_value is None or not isinstance(stream_value, dict) or "_stream_entries" not in stream_value:
+                                                        continue
+                                                    
+                                                    # Get all entries
+                                                    entries = stream_value["_stream_entries"]
+                                                    
+                                                    # Filter entries greater than the specified ID (exclusive)
+                                                    filtered_entries = []
+                                                    for entry in entries:
+                                                        entry_id = entry["id"]
+                                                        entry_ms, entry_seq = parse_stream_id(entry_id)
+                                                        
+                                                        # Include entries with ID > read_id
+                                                        if compare_stream_ids(entry_ms, entry_seq, read_ms, read_seq) > 0:
+                                                            # Entry ID is greater than read_id, include it
+                                                            filtered_entries.append(entry)
+                                                    
+                                                    # Format entries for response
+                                                    if filtered_entries:
+                                                        response_entries = []
+                                                        for entry in filtered_entries:
+                                                            entry_id = entry["id"]
+                                                            # Build key-value pairs list (excluding the "id" key)
+                                                            kv_list = []
+                                                            for key_name in sorted(entry.keys()):
+                                                                if key_name != "id":
+                                                                    kv_list.append(key_name)
+                                                                    kv_list.append(entry[key_name])
+                                                            
+                                                            # Each entry is [entry_id, [k1, v1, k2, v2, ...]]
+                                                            response_entries.append([entry_id, kv_list])
+                                                        
+                                                        # Add to result streams
+                                                        result_streams.append([stream_key, response_entries])
+                                            
+                                            if result_streams:
+                                                response = encode_streams_response(result_streams)
+                                                conn.sendall(response)
+                                            else:
+                                                # No data found, return null array
+                                                response = encode_null_array()
+                                                conn.sendall(response)
+                                        else:
+                                            # Timeout expired, return null array
+                                            response = encode_null_array()
+                                            conn.sendall(response)
+                                        
+                                        # Clean up the blocked client registration
+                                        with blocked_streams_lock:
+                                            for stream_key in stream_keys:
+                                                if stream_key in blocked_streams:
+                                                    # Remove this client from the blocked list
+                                                    blocked_streams[stream_key] = [(c, e) for c, e in blocked_streams[stream_key] if e is not event]
+                                                    if len(blocked_streams[stream_key]) == 0:
+                                                        del blocked_streams[stream_key]
+                                    else:
+                                        # No data and not blocking, return null array
+                                        response = encode_null_array()
+                                        conn.sendall(response)
                             continue
                         continue
+                    else:
+                        # Unknown command
+                        conn.sendall(b"-ERR unknown command\r\n")
                 else:
-                    # Unknown command
-                    conn.sendall(b"-ERR unknown command\r\n")
+                    # We're in a transaction and this is not a transaction control command
+                    # Queue the command and return "+QUEUED\r\n"
+                    with transaction_states_lock:
+                        transaction_states[conn_id]["queued_commands"].append(command_parts)
+                    conn.sendall(encode_simple_string("QUEUED"))
     finally:
         with connections_lock:
             active_connections -= 1
