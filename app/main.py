@@ -28,6 +28,11 @@ blocked_streams_lock = threading.Lock()
 transaction_states = {}
 transaction_states_lock = threading.Lock()
 
+# Dictionary to track watched keys per connection
+# Format: {connection_id: set of watched keys}
+watched_keys = {}
+watched_keys_lock = threading.Lock()
+
 # Metrics tracking
 start_time = time.time()
 active_connections = 0
@@ -286,6 +291,13 @@ def execute_command(command_parts):
             return encode_bulk_string(command_parts[1])
         else:
             return b"-ERR wrong number of arguments for 'echo' command\r\n"
+    elif command == "WATCH":
+        if len(command_parts) < 2:
+            return b"-ERR wrong number of arguments for 'watch' command\r\n"
+        
+        # For this stage, we only need to parse and respond with +OK
+        # In later stages, we'll implement the actual watch tracking
+        return b"+OK\r\n"
     elif command == "SET":
         if len(command_parts) < 3:
             return b"-ERR wrong number of arguments for 'set' command\r\n"
@@ -1274,6 +1286,10 @@ def handle_client(conn, addr):
             "queued_commands": []
         }
     
+    # Initialize watched keys for this connection
+    with watched_keys_lock:
+        watched_keys[conn_id] = set()
+    
     try:
         with conn:
             while True:
@@ -1295,8 +1311,8 @@ def handle_client(conn, addr):
                 with transaction_states_lock:
                     in_transaction = transaction_states[conn_id]["in_transaction"]
                 
-                # Commands that should not be queued: MULTI, EXEC, DISCARD
-                if command in ["MULTI", "EXEC", "DISCARD"] or not in_transaction:
+                # Commands that should not be queued: MULTI, EXEC, DISCARD, WATCH
+                if command in ["MULTI", "EXEC", "DISCARD", "WATCH"] or not in_transaction:
                     # Process commands normally (not in transaction or special transaction commands)
                     if command == "MULTI":
                         # Start a transaction
@@ -1363,6 +1379,10 @@ def handle_client(conn, addr):
         # Clean up transaction state for this connection
         with transaction_states_lock:
             transaction_states.pop(conn_id, None)
+        
+        # Clean up watched keys for this connection
+        with watched_keys_lock:
+            watched_keys.pop(conn_id, None)
         
         print(f"Client disconnected: {addr}")
 
