@@ -1311,67 +1311,90 @@ def handle_client(conn, addr):
                 with transaction_states_lock:
                     in_transaction = transaction_states[conn_id]["in_transaction"]
                 
-                # Commands that should not be queued: MULTI, EXEC, DISCARD, WATCH
-                if command in ["MULTI", "EXEC", "DISCARD", "WATCH"] or not in_transaction:
-                    # Process commands normally (not in transaction or special transaction commands)
-                    if command == "MULTI":
+                # Handle MULTI command
+                if command == "MULTI":
+                    if in_transaction:
+                        # MULTI called inside a transaction
+                        conn.sendall(encode_error("ERR MULTI calls can not be nested"))
+                    else:
                         # Start a transaction
                         with transaction_states_lock:
                             transaction_states[conn_id]["in_transaction"] = True
                             transaction_states[conn_id]["queued_commands"] = []
                         conn.sendall(encode_simple_string("OK"))
-                    elif command == "EXEC":
-                        # Execute all queued commands
-                        with transaction_states_lock:
-                            in_transaction = transaction_states[conn_id]["in_transaction"]
-                            queued_commands = transaction_states[conn_id]["queued_commands"][:]
-                            # Mark transaction as complete
+                
+                # Handle WATCH command
+                elif command == "WATCH":
+                    if in_transaction:
+                        # WATCH called inside a transaction
+                        conn.sendall(encode_error("ERR WATCH inside MULTI is not allowed"))
+                    else:
+                        # WATCH called outside transaction
+                        if len(command_parts) < 2:
+                            conn.sendall(encode_error("ERR wrong number of arguments for 'watch' command"))
+                        else:
+                            # Add keys to watched set
+                            with watched_keys_lock:
+                                for key in command_parts[1:]:
+                                    watched_keys[conn_id].add(key)
+                            conn.sendall(encode_simple_string("OK"))
+                
+                # Handle EXEC command
+                elif command == "EXEC":
+                    with transaction_states_lock:
+                        is_in_transaction = transaction_states[conn_id]["in_transaction"]
+                        queued_commands = transaction_states[conn_id]["queued_commands"][:]
+                        # Mark transaction as complete
+                        transaction_states[conn_id]["in_transaction"] = False
+                        transaction_states[conn_id]["queued_commands"] = []
+                    
+                    if not is_in_transaction:
+                        # EXEC called without MULTI
+                        conn.sendall(encode_error("ERR EXEC without MULTI"))
+                    else:
+                        # Execute the queued commands and collect results
+                        results = []
+                        for queued_cmd in queued_commands:
+                            # Execute each command and collect the raw response
+                            cmd_response = execute_command(queued_cmd)
+                            results.append(cmd_response)
+                        
+                        # Build the array response
+                        if not results:
+                            # Empty transaction
+                            response = encode_array([])
+                            conn.sendall(response)
+                        else:
+                            # Build array of results as a string array representation
+                            # We need to parse the results and re-encode them as an array
+                            array_response = build_array_from_responses(results)
+                            conn.sendall(array_response)
+                
+                # Handle DISCARD command
+                elif command == "DISCARD":
+                    with transaction_states_lock:
+                        is_in_transaction = transaction_states[conn_id]["in_transaction"]
+                        if is_in_transaction:
                             transaction_states[conn_id]["in_transaction"] = False
                             transaction_states[conn_id]["queued_commands"] = []
-                        
-                        if not in_transaction:
-                            # EXEC called without MULTI
-                            conn.sendall(encode_error("ERR EXEC without MULTI"))
-                        else:
-                            # Execute the queued commands and collect results
-                            results = []
-                            for queued_cmd in queued_commands:
-                                # Execute each command and collect the raw response
-                                cmd_response = execute_command(queued_cmd)
-                                results.append(cmd_response)
-                            
-                            # Build the array response
-                            if not results:
-                                # Empty transaction
-                                response = encode_array([])
-                                conn.sendall(response)
-                            else:
-                                # Build array of results as a string array representation
-                                # We need to parse the results and re-encode them as an array
-                                array_response = build_array_from_responses(results)
-                                conn.sendall(array_response)
-                    elif command == "DISCARD":
-                        # Discard the transaction
+                    
+                    if not is_in_transaction:
+                        conn.sendall(encode_error("ERR DISCARD without MULTI"))
+                    else:
+                        conn.sendall(encode_simple_string("OK"))
+                
+                # Handle other commands
+                else:
+                    if in_transaction:
+                        # We're in a transaction and this is not a transaction control command
+                        # Queue the command and return "+QUEUED\r\n"
                         with transaction_states_lock:
-                            in_transaction = transaction_states[conn_id]["in_transaction"]
-                            if in_transaction:
-                                transaction_states[conn_id]["in_transaction"] = False
-                                transaction_states[conn_id]["queued_commands"] = []
-                        
-                        if not in_transaction:
-                            conn.sendall(encode_error("ERR DISCARD without MULTI"))
-                        else:
-                            conn.sendall(encode_simple_string("OK"))
+                            transaction_states[conn_id]["queued_commands"].append(command_parts)
+                        conn.sendall(encode_simple_string("QUEUED"))
                     else:
                         # Normal command execution
                         response = execute_command(command_parts)
                         conn.sendall(response)
-                else:
-                    # We're in a transaction and this is not a transaction control command
-                    # Queue the command and return "+QUEUED\r\n"
-                    with transaction_states_lock:
-                        transaction_states[conn_id]["queued_commands"].append(command_parts)
-                    conn.sendall(encode_simple_string("QUEUED"))
     finally:
         with connections_lock:
             active_connections -= 1
